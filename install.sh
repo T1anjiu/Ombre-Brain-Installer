@@ -79,6 +79,7 @@ if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   C_GREEN=$'\033[32m'
   C_YELLOW=$'\033[33m'
   C_BLUE=$'\033[34m'
+  C_CYAN=$'\033[36m'
   C_BOLD=$'\033[1m'
   C_RESET=$'\033[0m'
 else
@@ -86,6 +87,7 @@ else
   C_GREEN=""
   C_YELLOW=""
   C_BLUE=""
+  C_CYAN=""
   C_BOLD=""
   C_RESET=""
 fi
@@ -776,6 +778,23 @@ health_host() {
   else
     printf '%s\n' "$BIND_ADDRESS"
   fi
+}
+
+detect_public_ipv4() {
+  local endpoint candidate
+  local -a endpoints=(
+    "https://api.ipify.org"
+    "https://ipv4.icanhazip.com"
+    "https://ifconfig.me/ip"
+  )
+  for endpoint in "${endpoints[@]}"; do
+    candidate="$(fetch_url "$endpoint" 2>/dev/null | tr -d '[:space:]' || true)"
+    if validate_ipv4 "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
 }
 
 redact_stream() {
@@ -1649,61 +1668,78 @@ show_install_summary() {
 }
 
 post_install_instructions() {
-  local context=${1:-install} host_ip="" ssh_user
-  ssh_user="${SUDO_USER:-${USER:-root}}"
-  if [[ -n "${SSH_CONNECTION:-}" ]]; then
-    host_ip="$(awk '{print $3}' <<<"$SSH_CONNECTION")"
+  local context=${1:-install} host_ip="" public_ip="" ssh_user
+  ssh_user="${OMBRE_SSH_USER:-${SUDO_USER:-${USER:-root}}}"
+  if command -v hostname >/dev/null 2>&1; then
+    host_ip="$({ hostname -I 2>/dev/null || true; } | awk '{for (i = 1; i <= NF; i++) if ($i !~ /^127\./) {print $i; exit}}')"
   fi
-  if [[ -z "$host_ip" ]] && command -v hostname >/dev/null 2>&1; then
-    host_ip="$({ hostname -I 2>/dev/null || true; } | awk '{print $1}')"
+  if [[ "$ACCESS_MODE" != "lan" ]]; then
+    public_ip="$(detect_public_ipv4 || true)"
   fi
-  [[ -n "$host_ip" ]] || host_ip="你的服务器IP"
+  [[ -n "$host_ip" ]] || host_ip="你的局域网地址"
   if [[ "$context" == "configure" ]]; then
     printf '\n%s%s配置已应用，Ombre Brain 健康检查通过%s\n' "$C_BOLD" "$C_GREEN" "$C_RESET"
   else
     printf '\n%s%sOmbre Brain 已就绪%s\n' "$C_BOLD" "$C_GREEN" "$C_RESET"
-    printf '\n%s小白首次使用五步走%s\n' "$C_BOLD" "$C_RESET"
-    printf '  1) 按下方说明打开 Dashboard 并登录\n'
+    printf '\n%s%s小白首次使用：请按下面 5 步操作%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '\n%s%s第 1 步：打开 Dashboard%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '  地址：%shttp://127.0.0.1:%s%s\n' "$C_BOLD" "$PORT" "$C_RESET"
+    printf '  先不要配置模型，继续看下面的密码和 SSH 步骤。\n'
+    printf '\n%s%s第 2 步：登录 Dashboard%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
     if ((GENERATED_PASSWORD)); then
-      printf '  2) 使用下方自动生成的密码；登录后立即改成自己记得住的强密码\n'
+      printf '  使用下方自动生成的密码登录；登录后立即改成自己记得住的强密码。\n'
     else
-      printf '  2) 使用你刚才亲自输入的密码登录；安装器不会再次显示它\n'
+      printf '  使用你刚才亲自输入的密码登录；安装器不会再次显示它。\n'
     fi
-    printf '  3) Dashboard → ③ 引擎：分别填写“压缩模型”和“向量模型”的 Key，并分别点测试\n'
-    printf '  4) Dashboard → ⑥ MCP 配置：复制生成的 /mcp 连接地址或配置\n'
-    printf '  5) 把连接添加到 Claude Desktop、Claude Code 或 claude.ai，再发送“你好”验证\n\n'
+    printf '\n%s%s第 3 步：配置模型%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '  Dashboard → ③ 引擎\n'
+    printf '  分别填写“压缩模型”和“向量模型”的 Key，然后分别点击测试。\n'
+    printf '\n%s%s第 4 步：复制 MCP 配置%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '  Dashboard → ⑥ MCP 配置\n'
+    printf '  复制生成的 /mcp 连接地址或客户端配置。\n'
+    printf '\n%s%s第 5 步：连接 Claude%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '  把 MCP 连接添加到 Claude Desktop、Claude Code 或 claude.ai。\n'
+    printf '  然后发送“你好”，确认 Ombre Brain 能被调用。\n\n'
   fi
   case "$ACCESS_MODE" in
-    lan) printf '  Dashboard：http://%s:%s\n' "$host_ip" "$PORT" ;;
+    lan)
+      printf '%s%s局域网访问地址：%shttp://%s:%s%s\n' "$C_BOLD" "$C_GREEN" "$C_BOLD" "$host_ip" "$PORT" "$C_RESET"
+      printf '  请只在可信局域网内使用，并自行配置防火墙边界。\n'
+      ;;
     *)
-      printf '  Dashboard：http://127.0.0.1:%s\n' "$PORT"
-      printf '\n  这是安全的本机地址，不能直接在远程服务器之外打开。\n'
+      printf '%s%s本机安全访问地址：%shttp://127.0.0.1:%s%s\n' "$C_BOLD" "$C_GREEN" "$C_BOLD" "$PORT" "$C_RESET"
+      printf '\n  这是服务器本机地址，公网不会直接访问到 Dashboard。\n'
       printf '  请在“自己的电脑”上新开终端执行下面这条命令，不是在服务器里执行：\n'
-      printf '  ssh -N -L %s:127.0.0.1:%s %s@%s\n' "$PORT" "$PORT" "$ssh_user" "$host_ip"
-      printf '  如果上面的 IP 不是你平时登录服务器使用的地址，请替换成云厂商给你的 SSH IP。\n'
-      printf '  这个 SSH 窗口必须保持开启；然后在自己电脑浏览器打开 http://127.0.0.1:%s\n' "$PORT"
+      if [[ -n "$public_ip" ]]; then
+        printf '  %s%sssh -N -L %s:127.0.0.1:%s %s@%s%s\n' "$C_BOLD" "$C_YELLOW" "$PORT" "$PORT" "$ssh_user" "$public_ip" "$C_RESET"
+        printf '  已自动检测到服务器公网 IPv4：%s%s%s\n' "$C_BOLD" "$public_ip" "$C_RESET"
+      else
+        printf '  %s%sssh -N -L %s:127.0.0.1:%s %s@YOUR_SERVER_PUBLIC_IP%s\n' "$C_BOLD" "$C_YELLOW" "$PORT" "$PORT" "$ssh_user" "$C_RESET"
+        printf '  %s%s未能自动检测公网 IP，请把 YOUR_SERVER_PUBLIC_IP 替换成云厂商控制台显示的公网 IPv4。%s\n' "$C_YELLOW" "$C_BOLD" "$C_RESET"
+      fi
+      printf '  这个 SSH 窗口必须保持开启；然后在自己电脑浏览器打开：%shttp://127.0.0.1:%s%s\n' "$C_BOLD" "$PORT" "$C_RESET"
       ;;
   esac
   if ((GENERATED_PASSWORD)); then
-    printf '  本次生成的 Dashboard 密码：%s\n' "$DASHBOARD_PASSWORD"
+    printf '\n%s%s重要：本次生成的 Dashboard 密码：%s%s%s\n' "$C_BOLD" "$C_YELLOW" "$C_BOLD" "$DASHBOARD_PASSWORD" "$C_RESET"
     printf '  请立即保存；之后可用 ombrectl configure 更换。\n'
   fi
   if [[ "$MODEL_MANAGEMENT" == "dashboard" ]]; then
-    printf '  模型配置：登录 Dashboard → ③ 引擎，分别配置并测试压缩模型与向量模型。\n'
+    printf '\n%s模型配置：%s登录 Dashboard → ③ 引擎，分别配置并测试压缩模型与向量模型。%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
   else
-    printf '  模型由 /etc/ombre-brain/ombre.env 托管；请在 Dashboard 分别测试压缩和向量接口。\n'
+    printf '\n%s模型配置：%s由 /etc/ombre-brain/ombre.env 托管；请在 Dashboard 分别测试压缩和向量接口。%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
   fi
   if [[ "$ACCESS_MODE" == "public_secure" ]]; then
-    printf '  公网安全：准备 Cloudflare 账号及已托管域名，再经 SSH 登录 Dashboard 配置内置 Tunnel，最后在 /onboarding 选择“公网安全”。\n'
+    printf '\n%s%s公网安全引导：%s准备 Cloudflare 账号及已托管域名，再经 SSH 登录 Dashboard 配置内置 Tunnel，最后在 /onboarding 选择“公网安全”。%s\n' "$C_BOLD" "$C_YELLOW" "$C_RESET" "$C_RESET"
   fi
-  printf '\n常用命令：\n'
-  printf '  ombrectl status      查看状态\n'
-  printf '  ombrectl doctor      完整诊断\n'
-  printf '  ombrectl logs        跟踪脱敏日志（按 Ctrl+C 退出，不会停止服务）\n'
-  printf '  ombrectl configure   修改端口、密码或模型配置\n'
-  printf '  ombrectl update      安全更新并在失败时回滚镜像\n'
-  printf '\nMCP 地址路径：/mcp（完整地址可在 Dashboard → ⑥ MCP 配置复制）\n'
-  printf '记忆永久目录：%s\n' "$DATA_DIR"
+  printf '\n%s%s常用命令%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  printf '  %sombrectl status%s       查看状态\n' "$C_BOLD" "$C_RESET"
+  printf '  %sombrectl doctor%s       完整诊断\n' "$C_BOLD" "$C_RESET"
+  printf '  %sombrectl logs%s         跟踪脱敏日志（按 Ctrl+C 退出，不会停止服务）\n' "$C_BOLD" "$C_RESET"
+  printf '  %sombrectl configure%s    修改端口、密码或模型配置\n' "$C_BOLD" "$C_RESET"
+  printf '  %sombrectl update%s       安全更新并在失败时回滚镜像\n' "$C_BOLD" "$C_RESET"
+  printf '\nMCP 地址路径：%s/mcp%s（完整地址可在 Dashboard → ⑥ MCP 配置复制）\n' "$C_BOLD" "$C_RESET"
+  printf '记忆永久目录：%s%s%s\n' "$C_BOLD" "$DATA_DIR" "$C_RESET"
 }
 
 fail_install_runtime() {
