@@ -5,10 +5,14 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="1.1.0"
+INSTALLER_VERSION="1.2.0"
 STATE_VERSION="1"
 PROJECT_NAME="ombre-brain-managed"
 CONTAINER_NAME="ombre-brain"
+CADDY_PROJECT_NAME="ombre-brain-caddy-managed"
+CADDY_CONTAINER_NAME="ombre-brain-caddy"
+CADDY_IMAGE="caddy:2-alpine"
+CADDY_NETWORK_NAME="ombre-brain-caddy-managed-proxy"
 IMAGE_NAME="p0luz/ombre-brain:latest"
 REPO_URL="https://github.com/P0luz/Ombre-Brain.git"
 RAW_BASE_URL="https://raw.githubusercontent.com/T1anjiu/Ombre-Brain-Installer/main"
@@ -31,6 +35,7 @@ PORT="18001"
 BIND_ADDRESS="127.0.0.1"
 ACCESS_MODE="local"
 TRUSTED_PROXY_CIDRS="127.0.0.0/8,::1/128"
+PUBLIC_DOMAIN=""
 MODEL_MANAGEMENT="dashboard"
 INSTALLED="0"
 STATE_LOADED=0
@@ -51,6 +56,8 @@ ADOPT_WAS_RUNNING="false"
 ADOPTION_ACTIVE=0
 ADOPTION_BACKUP_READY=0
 GENERATED_PASSWORD=0
+CADDY_READY=0
+CADDY_TRUST_CHANGED=0
 
 DASHBOARD_PASSWORD=""
 COMPRESS_API_KEY=""
@@ -391,6 +398,46 @@ looks_like_vault() {
   ((evidence >= 2))
 }
 
+validate_domain() {
+  local value=${1-} label
+  local -a labels=()
+  [[ -n "$value" && ${#value} -le 253 && "$value" == *.* ]] || return 1
+  validate_ipv4 "$value" && return 1
+  [[ "$value" == *[!0-9.]* ]] || return 1
+  [[ "$value" == "${value,,}" && "$value" != *[!a-z0-9.-]* ]] || return 1
+  [[ "$value" != .* && "$value" != *. && "$value" != *..* ]] || return 1
+  IFS='.' read -r -a labels <<<"$value"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+  done
+}
+
+normalize_public_domain() {
+  local value=${1-}
+  validate_no_newline "$value" || return 1
+  value=${value,,}
+  [[ "$value" != http://* ]] || return 1
+  value=${value#https://}
+  case "$value" in
+    */mcp/) value=${value%/}; value=${value%/mcp} ;;
+    */mcp) value=${value%/mcp} ;;
+    */) value=${value%/} ;;
+  esac
+  [[ "$value" != *'/'* && "$value" != *'?'* && "$value" != *'#'* \
+      && "$value" != *'@'* && "$value" != *':'* ]] || return 1
+  validate_domain "$value" || return 1
+  printf '%s\n' "$value"
+}
+
+yaml_quote() {
+  local value=${1-}
+  validate_no_newline "$value" || return 1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '"%s"' "$value"
+}
+
 port_in_use() {
   local candidate=$1
   if command -v ss >/dev/null 2>&1; then
@@ -496,9 +543,13 @@ validate_loaded_state() {
   validate_ipv4 "$BIND_ADDRESS" || return 1
   validate_proxy_cidrs "$TRUSTED_PROXY_CIDRS" || return 1
   case "$ACCESS_MODE" in
-    local|lan|public_secure|advanced) ;;
+    local|lan|public_caddy|public_secure|advanced) ;;
     *) return 1 ;;
   esac
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    validate_domain "$PUBLIC_DOMAIN" || return 1
+    [[ "$BIND_ADDRESS" == "127.0.0.1" ]] || return 1
+  fi
   case "$MODEL_MANAGEMENT" in
     dashboard|terminal) ;;
     *) return 1 ;;
@@ -511,13 +562,14 @@ validate_loaded_state() {
 read_state() {
   local key value file_state_version=""
   STATE_LOADED=0
+  PUBLIC_DOMAIN=""
   [[ -f "$STATE_FILE" ]] || return 1
   while IFS='=' read -r key value || [[ -n "$key" ]]; do
     case "$key" in
       STATE_VERSION)
         file_state_version=$value
         ;;
-      INSTALLED|MODE|APP_DIR|CONFIG_DIR|DATA_DIR|ENV_FILE|COMPOSE_FILE|SOURCE_DIR|PORT|BIND_ADDRESS|ACCESS_MODE|TRUSTED_PROXY_CIDRS|MODEL_MANAGEMENT|BIN_LINK)
+      INSTALLED|MODE|APP_DIR|CONFIG_DIR|DATA_DIR|ENV_FILE|COMPOSE_FILE|SOURCE_DIR|PORT|BIND_ADDRESS|ACCESS_MODE|TRUSTED_PROXY_CIDRS|PUBLIC_DOMAIN|MODEL_MANAGEMENT|BIN_LINK)
         printf -v "$key" '%s' "$value"
         ;;
     esac
@@ -547,6 +599,7 @@ write_state() {
     printf 'BIND_ADDRESS=%s\n' "$BIND_ADDRESS"
     printf 'ACCESS_MODE=%s\n' "$ACCESS_MODE"
     printf 'TRUSTED_PROXY_CIDRS=%s\n' "$TRUSTED_PROXY_CIDRS"
+    printf 'PUBLIC_DOMAIN=%s\n' "$PUBLIC_DOMAIN"
     printf 'MODEL_MANAGEMENT=%s\n' "$MODEL_MANAGEMENT"
     printf 'BIN_LINK=%s\n' "$BIN_LINK"
   } >"$temp"
@@ -717,6 +770,9 @@ use_existing_docker() {
 
 compose_run() {
   local args=(compose --project-name "$PROJECT_NAME" --env-file "$ENV_FILE" -f "$COMPOSE_FILE")
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    args+=(-f "$(caddy_app_override_file)")
+  fi
   if ((DRY_RUN)); then
     print_command "${DOCKER[@]}" "${args[@]}" "$@"
     return 0
@@ -741,6 +797,331 @@ compose_run_with_file() {
   else
     "${DOCKER[@]}" "${args[@]}" "$@"
   fi
+}
+
+caddy_compose_file() {
+  printf '%s/caddy-compose.yaml\n' "$APP_DIR"
+}
+
+caddy_app_override_file() {
+  printf '%s/caddy-app-network.override.yaml\n' "$APP_DIR"
+}
+
+caddy_config_file() {
+  printf '%s/caddy/Caddyfile\n' "$CONFIG_DIR"
+}
+
+render_caddy_compose() {
+  local config_path
+  config_path="$(caddy_config_file)"
+  printf '%s\n' \
+    '# managed-by=ombrectl' \
+    'services:' \
+    '  caddy:' \
+    "    image: $CADDY_IMAGE" \
+    "    container_name: $CADDY_CONTAINER_NAME" \
+    '    restart: unless-stopped' \
+    '    labels:' \
+    '      com.ombre-brain.installer-managed: "true"' \
+    '    ports:' \
+    '      - "80:80"' \
+    '      - "443:443"' \
+    '    networks:' \
+    '      - caddy-proxy' \
+    '    volumes:' \
+    '      - type: bind' \
+    "        source: $(yaml_quote "$config_path")" \
+    '        target: /etc/caddy/Caddyfile' \
+    '        read_only: true' \
+    '      - caddy-data:/data' \
+    '      - caddy-config:/config' \
+    'volumes:' \
+    '  caddy-data:' \
+    '  caddy-config:' \
+    'networks:' \
+    '  caddy-proxy:' \
+    '    external: true' \
+    "    name: $CADDY_NETWORK_NAME"
+}
+
+render_caddy_app_override() {
+  printf '%s\n' \
+    '# managed-by=ombrectl' \
+    'services:' \
+    '  ombre-brain:' \
+    '    networks:' \
+    '      - default' \
+    '      - caddy-proxy' \
+    'networks:' \
+    '  default:' \
+    '  caddy-proxy:' \
+    '    external: true' \
+    "    name: $CADDY_NETWORK_NAME"
+}
+
+render_caddyfile() {
+  validate_domain "$PUBLIC_DOMAIN" || return 1
+  validate_port "$PORT" || return 1
+  printf '%s\n' \
+    '# managed-by=ombrectl' \
+    '{' \
+    '    servers {' \
+    '        protocols h1 h2' \
+    '    }' \
+    '}' \
+    '' \
+    "$PUBLIC_DOMAIN {" \
+    '    reverse_proxy ombre-brain:8000 {' \
+    '        flush_interval -1' \
+    '    }' \
+    '}'
+}
+
+caddy_asset_is_managed_or_absent() {
+  local path=$1 first_line=""
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    return 0
+  fi
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  IFS= read -r first_line <"$path" || true
+  [[ "$first_line" == '# managed-by=ombrectl' ]]
+}
+
+prepare_caddy_assets() {
+  local compose_temp config_temp config_dir compose_path config_path
+  [[ "$ACCESS_MODE" == "public_caddy" ]] || return 0
+  compose_path="$(caddy_compose_file)"
+  config_path="$(caddy_config_file)"
+  caddy_asset_is_managed_or_absent "$compose_path" || {
+    error "Caddy Compose 文件已存在但不属于 ombrectl，拒绝覆盖：$compose_path"
+    return 1
+  }
+  caddy_asset_is_managed_or_absent "$config_path" || {
+    error "Caddyfile 已存在但不属于 ombrectl，拒绝覆盖：$config_path"
+    return 1
+  }
+  config_dir="$(dirname "$config_path")"
+  run_root install -d -m 0755 -- "$APP_DIR" "$CONFIG_DIR" "$config_dir" || return 1
+  make_temp compose_temp
+  make_temp config_temp
+  render_caddy_compose >"$compose_temp" || return 1
+  render_caddyfile >"$config_temp" || return 1
+  atomic_install_file "$compose_temp" "$compose_path" 0644 || return 1
+  atomic_install_file "$config_temp" "$config_path" 0644 || return 1
+  if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
+    run_root chcon -t container_file_t -- "$config_path" \
+      || warn "Caddyfile 的 SELinux 标记失败；若 Caddy 日志提示 Permission denied，请检查该文件策略。"
+  fi
+}
+
+caddy_network_exists() {
+  ((${#DOCKER[@]} > 0)) || return 1
+  "${DOCKER[@]}" network inspect "$CADDY_NETWORK_NAME" >/dev/null 2>&1
+}
+
+managed_caddy_network_exists() {
+  local managed
+  caddy_network_exists || return 1
+  managed="$("${DOCKER[@]}" network inspect --format '{{index .Labels "com.ombre-brain.installer-managed"}}' "$CADDY_NETWORK_NAME" 2>/dev/null || true)"
+  [[ "$managed" == "true" ]]
+}
+
+ensure_caddy_network() {
+  if ((DRY_RUN)); then
+    info "演练模式：将创建或复用受管理网络 $CADDY_NETWORK_NAME。"
+    return 0
+  fi
+  if caddy_network_exists; then
+    managed_caddy_network_exists \
+      || die "Docker 网络 $CADDY_NETWORK_NAME 已存在但不属于 ombrectl；拒绝覆盖。"
+    return 0
+  fi
+  "${DOCKER[@]}" network create \
+    --label com.ombre-brain.installer-managed=true \
+    "$CADDY_NETWORK_NAME" >/dev/null \
+    || die "无法创建 Caddy 专用 Docker 网络：$CADDY_NETWORK_NAME"
+}
+
+caddy_network_ipv4_subnet() {
+  local subnet
+  caddy_network_exists || return 1
+  while IFS= read -r subnet; do
+    [[ "$subnet" != *:* ]] || continue
+    if validate_proxy_cidrs "$subnet"; then
+      printf '%s\n' "$subnet"
+      return 0
+    fi
+  done < <("${DOCKER[@]}" network inspect \
+    --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}' \
+    "$CADDY_NETWORK_NAME" 2>/dev/null)
+  return 1
+}
+
+prepare_caddy_network_assets() {
+  local override_temp override_path subnet desired
+  [[ "$ACCESS_MODE" == "public_caddy" ]] || return 0
+  CADDY_TRUST_CHANGED=0
+  override_path="$(caddy_app_override_file)"
+  caddy_asset_is_managed_or_absent "$override_path" \
+    || die "Caddy 应用网络覆盖文件已存在但不属于 ombrectl，拒绝覆盖：$override_path"
+  ensure_caddy_network
+  if ! ((DRY_RUN)); then
+    subnet="$(caddy_network_ipv4_subnet)" \
+      || die "无法读取 Caddy 专用 Docker 网络的 IPv4 子网。"
+    desired="127.0.0.0/8,::1/128,$subnet"
+    if [[ "$TRUSTED_PROXY_CIDRS" != "$desired" ]]; then
+      TRUSTED_PROXY_CIDRS=$desired
+      CADDY_TRUST_CHANGED=1
+    fi
+  fi
+  make_temp override_temp
+  render_caddy_app_override >"$override_temp" || return 1
+  atomic_install_file "$override_temp" "$override_path" 0644 || return 1
+}
+
+remove_managed_caddy_network() {
+  caddy_network_exists || return 0
+  if ! managed_caddy_network_exists; then
+    warn "同名 Docker 网络不属于 ombrectl，未删除：$CADDY_NETWORK_NAME"
+    return 0
+  fi
+  if ((DRY_RUN)); then
+    print_command "${DOCKER[@]}" network rm "$CADDY_NETWORK_NAME"
+    return 0
+  fi
+  "${DOCKER[@]}" network rm "$CADDY_NETWORK_NAME" >/dev/null 2>&1 \
+    || warn "Caddy 专用网络仍被其他容器使用，已保留：$CADDY_NETWORK_NAME"
+}
+
+caddy_compose_run() {
+  local file
+  file="$(caddy_compose_file)"
+  local -a args=(compose --project-name "$CADDY_PROJECT_NAME" -f "$file")
+  if ((DRY_RUN)); then
+    print_command "${DOCKER[@]}" "${args[@]}" "$@"
+    return 0
+  fi
+  "${DOCKER[@]}" "${args[@]}" "$@"
+}
+
+caddy_container_exists() {
+  ((${#DOCKER[@]} > 0)) || return 1
+  "${DOCKER[@]}" container inspect "$CADDY_CONTAINER_NAME" >/dev/null 2>&1
+}
+
+managed_caddy_exists() {
+  local project service managed
+  caddy_container_exists || return 1
+  project="$("${DOCKER[@]}" inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$CADDY_CONTAINER_NAME" 2>/dev/null || true)"
+  service="$("${DOCKER[@]}" inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' "$CADDY_CONTAINER_NAME" 2>/dev/null || true)"
+  managed="$("${DOCKER[@]}" inspect --format '{{index .Config.Labels "com.ombre-brain.installer-managed"}}' "$CADDY_CONTAINER_NAME" 2>/dev/null || true)"
+  [[ "$project" == "$CADDY_PROJECT_NAME" && "$service" == "caddy" && "$managed" == "true" ]]
+}
+
+managed_caddy_running() {
+  local running
+  managed_caddy_exists || return 1
+  running="$("${DOCKER[@]}" inspect --format '{{.State.Running}}' "$CADDY_CONTAINER_NAME" 2>/dev/null || true)"
+  [[ "$running" == "true" ]]
+}
+
+docker_published_tcp_port_in_use() {
+  local candidate=$1
+  ((${#DOCKER[@]} > 0)) || return 1
+  "${DOCKER[@]}" ps --filter "publish=$candidate" --format '{{.ID}}' 2>/dev/null | grep -q .
+}
+
+validate_caddy_container_ownership() {
+  if caddy_container_exists && ! managed_caddy_exists; then
+    error "容器名 $CADDY_CONTAINER_NAME 已被其他服务占用。安装器不会覆盖它。"
+    return 1
+  fi
+}
+
+fetch_caddy_health() {
+  command -v curl >/dev/null 2>&1 || return 127
+  curl --fail --silent --show-error --max-time 10 --noproxy '*' \
+    --resolve "$PUBLIC_DOMAIN:443:127.0.0.1" \
+    "https://$PUBLIC_DOMAIN/health"
+}
+
+wait_for_caddy_https() {
+  local timeout=${1:-180} elapsed=0 body
+  if ((DRY_RUN)); then
+    info "演练模式：将通过本机 TLS 轮询 https://$PUBLIC_DOMAIN/health（最长 ${timeout} 秒）。"
+    CADDY_READY=1
+    return 0
+  fi
+  info "等待 Caddy 自动申请 HTTPS 证书（最长 ${timeout} 秒）..."
+  while ((elapsed < timeout)); do
+    body="$(fetch_caddy_health 2>/dev/null || true)"
+    if [[ "$body" == *'"status":"ok"'* || "$body" == *'"status": "ok"'* ]]; then
+      CADDY_READY=1
+      success "HTTPS 已就绪：https://$PUBLIC_DOMAIN"
+      return 0
+    fi
+    sleep 3
+    elapsed=$((elapsed + 3))
+  done
+  CADDY_READY=0
+  return 1
+}
+
+show_caddy_failure_details() {
+  error "Caddy/HTTPS 尚未就绪。容器状态："
+  "${DOCKER[@]}" ps -a --filter "name=^/${CADDY_CONTAINER_NAME}$" 2>&1 || true
+  error "Caddy 最近 100 行日志："
+  "${DOCKER[@]}" logs --tail 100 "$CADDY_CONTAINER_NAME" 2>&1 | redact_stream || true
+}
+
+start_managed_caddy() {
+  local timeout=${1:-180} pull_image=${2:-1}
+  [[ "$ACCESS_MODE" == "public_caddy" ]] || return 0
+  prepare_caddy_assets || return 1
+  validate_caddy_container_ownership || return 1
+  if ! caddy_compose_run config --quiet; then
+    error "Caddy Compose 配置校验失败：$(caddy_compose_file)"
+    return 1
+  fi
+  if ((pull_image)) && ! caddy_compose_run pull caddy; then
+    error "无法拉取 Caddy 镜像：$CADDY_IMAGE"
+    return 1
+  fi
+  if ! caddy_compose_run up -d --force-recreate caddy; then
+    error "Caddy 容器启动失败。"
+    show_caddy_failure_details
+    return 1
+  fi
+  if ! wait_for_caddy_https "$timeout"; then
+    show_caddy_failure_details
+    return 1
+  fi
+}
+
+stop_managed_caddy() {
+  caddy_container_exists || return 0
+  if ! managed_caddy_exists; then
+    error "发现同名但不属于 ombrectl 的容器 $CADDY_CONTAINER_NAME，拒绝停止。"
+    return 1
+  fi
+  if ((DRY_RUN)); then
+    print_command "${DOCKER[@]}" stop "$CADDY_CONTAINER_NAME"
+    return 0
+  fi
+  "${DOCKER[@]}" stop "$CADDY_CONTAINER_NAME" >/dev/null
+}
+
+remove_managed_caddy() {
+  caddy_container_exists || return 0
+  if ! managed_caddy_exists; then
+    error "发现同名但不属于 ombrectl 的容器 $CADDY_CONTAINER_NAME，拒绝移除。"
+    return 1
+  fi
+  if ((DRY_RUN)); then
+    print_command "${DOCKER[@]}" rm -f "$CADDY_CONTAINER_NAME"
+    return 0
+  fi
+  "${DOCKER[@]}" rm -f "$CADDY_CONTAINER_NAME" >/dev/null
 }
 
 container_exists() {
@@ -1140,22 +1521,52 @@ collect_model_configuration() {
 }
 
 collect_access_mode() {
-  local default_choice=${1:-1} choice custom
+  local default_choice=${1:-1} choice custom domain_input normalized_domain
   menu_choice choice "访问方式" "$default_choice" \
     "本机或 SSH 端口转发（127.0.0.1，推荐）" \
     "可信局域网（0.0.0.0，不自动改防火墙）" \
-    "公网安全（127.0.0.1 + Cloudflare 账号及已托管域名）" \
+    "公网自动 HTTPS（VPS + 自有域名，Caddy，推荐）" \
+    "Cloudflare Tunnel（已有 Cloudflare 账号时可选）" \
     "高级自定义绑定"
   case "$choice" in
-    1) ACCESS_MODE="local"; BIND_ADDRESS="127.0.0.1" ;;
+    1)
+      ACCESS_MODE="local"
+      BIND_ADDRESS="127.0.0.1"
+      TRUSTED_PROXY_CIDRS="127.0.0.0/8,::1/128"
+      PUBLIC_DOMAIN=""
+      ;;
     2)
       ACCESS_MODE="lan"
       BIND_ADDRESS="0.0.0.0"
+      TRUSTED_PROXY_CIDRS="127.0.0.0/8,::1/128"
+      PUBLIC_DOMAIN=""
       warn "局域网模式会监听所有网卡。安装器不会开放防火墙，请只允许可信网段访问。"
       ;;
-    3) ACCESS_MODE="public_secure"; BIND_ADDRESS="127.0.0.1" ;;
+    3)
+      ACCESS_MODE="public_caddy"
+      BIND_ADDRESS="127.0.0.1"
+      TRUSTED_PROXY_CIDRS="127.0.0.0/8,::1/128"
+      while true; do
+        prompt_line domain_input "用于 Ombre Brain 的域名（如 brain.example.com）" "$PUBLIC_DOMAIN"
+        if normalized_domain="$(normalize_public_domain "$domain_input")"; then
+          PUBLIC_DOMAIN=$normalized_domain
+          break
+        fi
+        warn "请输入纯域名或 https://域名[/mcp]；不能使用 IP、端口、http://、路径、查询参数或中文域名。"
+      done
+      warn "Caddy 会自动申请和续期证书；安装器不会替你修改域名 DNS 或云厂商安全组。"
+      confirm "已把该域名的 A 记录指向本机公网 IPv4，并放行入站 TCP 80/443，继续预检吗？" no \
+        || die "请先完成域名 A 记录和云安全组设置，再重新运行安装器。"
+      ;;
     4)
+      ACCESS_MODE="public_secure"
+      BIND_ADDRESS="127.0.0.1"
+      TRUSTED_PROXY_CIDRS="127.0.0.0/8,::1/128"
+      PUBLIC_DOMAIN=""
+      ;;
+    5)
       ACCESS_MODE="advanced"
+      PUBLIC_DOMAIN=""
       while true; do
         prompt_line custom "Docker 宿主机绑定 IPv4" "$BIND_ADDRESS"
         validate_ipv4 "$custom" && break
@@ -1486,12 +1897,16 @@ validate_install_targets() {
 }
 
 ensure_required_tools() {
-  if [[ "$MODE" == "source" ]] && ! command -v git >/dev/null 2>&1; then
-    info "源码安装和安全更新需要 Git，正在通过系统软件仓库安装基础工具。"
+  if { [[ "$MODE" == "source" ]] && ! command -v git >/dev/null 2>&1; } \
+      || { [[ "$ACCESS_MODE" == "public_caddy" ]] && ! command -v curl >/dev/null 2>&1; }; then
+    info "当前安装模式需要基础网络工具，正在通过系统软件仓库安装。"
     install_prerequisites
   fi
   if [[ "$MODE" == "source" ]]; then
     command -v git >/dev/null 2>&1 || die "Git 安装后仍不可用。请先运行 git --version 再重试。"
+  fi
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    command -v curl >/dev/null 2>&1 || die "Caddy HTTPS 本机校验需要 curl，但安装后仍不可用。"
   fi
 }
 
@@ -1576,6 +1991,78 @@ validate_network_access() {
   warn "$PREFLIGHT_NETWORK"
 }
 
+resolve_domain_ipv4s() {
+  local domain=$1 candidate raw=""
+  if command -v getent >/dev/null 2>&1; then
+    raw="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)"
+  elif command -v dig >/dev/null 2>&1; then
+    raw="$(dig +short A "$domain" 2>/dev/null | sort -u || true)"
+  elif command -v host >/dev/null 2>&1; then
+    raw="$(host -t A "$domain" 2>/dev/null | awk '/ has address / {print $NF}' | sort -u || true)"
+  else
+    return 127
+  fi
+  while IFS= read -r candidate; do
+    validate_ipv4 "$candidate" && printf '%s\n' "$candidate"
+  done <<<"$raw"
+}
+
+validate_caddy_preflight() {
+  local addresses="" public_ip="" address display="" match=0 mismatch=0
+  [[ "$ACCESS_MODE" == "public_caddy" ]] || return 0
+  validate_domain "$PUBLIC_DOMAIN" || die "Caddy 公网域名无效：$PUBLIC_DOMAIN"
+  [[ "$BIND_ADDRESS" == "127.0.0.1" ]] || die "Caddy 模式要求 Ombre Brain 只绑定 127.0.0.1。"
+  caddy_asset_is_managed_or_absent "$(caddy_compose_file)" \
+    || die "发现非 ombrectl 管理的同名 Caddy Compose 文件：$(caddy_compose_file)"
+  caddy_asset_is_managed_or_absent "$(caddy_app_override_file)" \
+    || die "发现非 ombrectl 管理的同名应用网络覆盖文件：$(caddy_app_override_file)"
+  caddy_asset_is_managed_or_absent "$(caddy_config_file)" \
+    || die "发现非 ombrectl 管理的同名 Caddyfile：$(caddy_config_file)"
+  if ((DRY_RUN)); then
+    info "演练模式：将检查 $PUBLIC_DOMAIN 的 A 记录是否指向本机公网 IPv4。"
+    info "演练模式：将检查 TCP 80/443 未被其他服务占用；不会修改 DNS 或防火墙。"
+    return 0
+  fi
+  addresses="$(resolve_domain_ipv4s "$PUBLIC_DOMAIN" || true)"
+  [[ -n "$addresses" ]] \
+    || die "域名 $PUBLIC_DOMAIN 暂无可用 A 记录。请先把它指向本机公网 IPv4，等待 DNS 生效后重试。"
+  display="$(printf '%s\n' "$addresses" | paste -sd, - | sed 's/,/, /g')"
+  info "域名 A 记录：$PUBLIC_DOMAIN -> $display"
+  public_ip="$(detect_public_ipv4 || true)"
+  if [[ -n "$public_ip" ]]; then
+    while IFS= read -r address; do
+      if [[ "$address" == "$public_ip" ]]; then
+        match=1
+      else
+        mismatch=1
+      fi
+    done <<<"$addresses"
+    ((match)) \
+      || die "域名 $PUBLIC_DOMAIN 当前未指向本机公网 IPv4 $public_ip（解析结果：$display）。修正 A 记录并等待生效后重试。"
+    ((!mismatch)) \
+      || die "域名 $PUBLIC_DOMAIN 还包含其他 A 记录（$display）。单机 Caddy 模式要求所有 A 记录都指向 $public_ip，否则证书验证可能随机失败。"
+    success "域名已指向本机公网 IPv4：$public_ip"
+  else
+    warn "无法自动探测本机公网 IPv4；已确认域名可解析，但请自行核对 A 记录。"
+  fi
+  if ((${#DOCKER[@]} == 0)); then
+    set_docker_command >/dev/null 2>&1 || true
+  fi
+  if ((${#DOCKER[@]} > 0)); then
+    validate_caddy_container_ownership \
+      || die "请改名或移走冲突容器 $CADDY_CONTAINER_NAME 后重试。"
+    if caddy_network_exists && ! managed_caddy_network_exists; then
+      die "Docker 网络 $CADDY_NETWORK_NAME 已存在但不属于 ombrectl；请改名或移走后重试。"
+    fi
+  fi
+  for address in 80 443; do
+    if { port_in_use "$address" || docker_published_tcp_port_in_use "$address"; } \
+        && ! managed_caddy_running; then
+      die "TCP $address 已被其他服务占用。Caddy 自动 HTTPS 必须独占 80/443；请先停用现有反向代理，或改选“高级自定义绑定”接入你自己的代理。"
+    fi
+  done
+}
+
 inspect_docker_status() {
   if ! command -v docker >/dev/null 2>&1; then
     PREFLIGHT_DOCKER="未安装；执行时将再次确认"
@@ -1604,7 +2091,8 @@ show_install_summary() {
   case "$ACCESS_MODE" in
     local) access_label="仅本机/SSH 转发；外网不能直接访问" ;;
     lan) access_label="可信局域网；监听所有网卡，安装器不改防火墙" ;;
-    public_secure) access_label="公网安全引导；当前仍只监听本机，不直接暴露公网" ;;
+    public_caddy) access_label="Caddy 自动 HTTPS/续期；Ombre Brain 仍只监听本机" ;;
+    public_secure) access_label="Cloudflare Tunnel 引导；当前仍只监听本机" ;;
     advanced) access_label="高级自定义绑定：$BIND_ADDRESS" ;;
   esac
   if [[ "$MODEL_MANAGEMENT" == "dashboard" ]]; then
@@ -1656,6 +2144,9 @@ show_install_summary() {
   printf '  记忆目录：%s\n' "$DATA_DIR"
   printf '  监听地址：%s:%s\n' "$BIND_ADDRESS" "$PORT"
   printf '  访问方式：%s\n' "$access_label"
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    printf '  公网域名：https://%s\n' "$PUBLIC_DOMAIN"
+  fi
   printf '  模型配置：%s\n' "$model_label"
   printf '  发行版：%s%s\n' "$OS_ID" "${OS_CODENAME:+ ($OS_CODENAME)}"
   printf '  CPU 架构：%s\n' "$ARCH"
@@ -1667,7 +2158,12 @@ show_install_summary() {
   if [[ "$MODE" == "source" ]]; then
     printf '  源码来源：%s\n' "$SOURCE_CHOICE"
   fi
-  printf '  防火墙/HTTPS：不自动修改\n'
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    printf '  HTTPS：Caddy 自动申请并续期证书\n'
+    printf '  DNS/云安全组：不自动修改；需要 A 记录及入站 TCP 80/443\n'
+  else
+    printf '  防火墙/HTTPS：不自动修改\n'
+  fi
   printf '  记忆删除：安装器永不删除 vault\n\n'
 }
 
@@ -1687,7 +2183,11 @@ post_install_instructions() {
     printf '\n%s%sOmbre Brain 已就绪%s\n' "$C_BOLD" "$C_GREEN" "$C_RESET"
     printf '\n%s%s小白首次使用：请按下面 5 步操作%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
     printf '\n%s%s第 1 步：打开 Dashboard%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
-    printf '  地址：%shttp://127.0.0.1:%s%s\n' "$C_BOLD" "$PORT" "$C_RESET"
+    if [[ "$ACCESS_MODE" == "public_caddy" && "$CADDY_READY" == "1" ]]; then
+      printf '  地址：%shttps://%s%s\n' "$C_BOLD" "$PUBLIC_DOMAIN" "$C_RESET"
+    else
+      printf '  地址：%shttp://127.0.0.1:%s%s\n' "$C_BOLD" "$PORT" "$C_RESET"
+    fi
     printf '  先不要配置模型，继续看下面的密码和 SSH 步骤。\n'
     printf '\n%s%s第 2 步：登录 Dashboard%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
     if ((GENERATED_PASSWORD)); then
@@ -1709,6 +2209,20 @@ post_install_instructions() {
     lan)
       printf '%s%s局域网访问地址：%shttp://%s:%s%s\n' "$C_BOLD" "$C_GREEN" "$C_BOLD" "$host_ip" "$PORT" "$C_RESET"
       printf '  请只在可信局域网内使用，并自行配置防火墙边界。\n'
+      ;;
+    public_caddy)
+      if ((CADDY_READY)); then
+        printf '%s%s公网 HTTPS 地址：%shttps://%s%s\n' "$C_BOLD" "$C_GREEN" "$C_BOLD" "$PUBLIC_DOMAIN" "$C_RESET"
+      else
+        printf '%s%s公网 HTTPS 尚在等待证书：%shttps://%s%s\n' "$C_BOLD" "$C_YELLOW" "$C_BOLD" "$PUBLIC_DOMAIN" "$C_RESET"
+      fi
+      printf '  Ombre Brain 本身仍只监听 127.0.0.1:%s，公网入口由 Caddy 管理。\n' "$PORT"
+      printf '  若公网暂时打不开，可在自己的电脑执行 SSH 备用访问：\n'
+      if [[ -n "$public_ip" ]]; then
+        printf '  %s%sssh -N -L %s:127.0.0.1:%s %s@%s%s\n' "$C_BOLD" "$C_YELLOW" "$PORT" "$PORT" "$ssh_user" "$public_ip" "$C_RESET"
+      else
+        printf '  %s%sssh -N -L %s:127.0.0.1:%s %s@YOUR_SERVER_PUBLIC_IP%s\n' "$C_BOLD" "$C_YELLOW" "$PORT" "$PORT" "$ssh_user" "$C_RESET"
+      fi
       ;;
     *)
       printf '%s%s本机安全访问地址：%shttp://127.0.0.1:%s%s\n' "$C_BOLD" "$C_GREEN" "$C_BOLD" "$PORT" "$C_RESET"
@@ -1732,6 +2246,24 @@ post_install_instructions() {
     printf '\n%s模型配置：%s登录 Dashboard → ③ 引擎，分别配置并测试压缩模型与向量模型。%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
   else
     printf '\n%s模型配置：%s由 /etc/ombre-brain/ombre.env 托管；请在 Dashboard 分别测试压缩和向量接口。%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  fi
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    printf '\n%s%sCaddy 自动 HTTPS：请完成下面 3 步%s\n' "$C_BOLD" "$C_YELLOW" "$C_RESET"
+    printf '%s第 1 步：确认公网地址%s\n' "$C_BOLD" "$C_RESET"
+    printf '  浏览器打开：%shttps://%s%s\n' "$C_BOLD" "$PUBLIC_DOMAIN" "$C_RESET"
+    printf '  Caddy 会自动申请和续期证书，不需要 Cloudflare Tunnel。\n'
+    printf '\n%s第 2 步：写入应用的公网地址%s\n' "$C_BOLD" "$C_RESET"
+    printf '  打开 %shttps://%s/onboarding%s，选择“公网安全模式”。\n' "$C_BOLD" "$PUBLIC_DOMAIN" "$C_RESET"
+    printf '  公网地址填写 %shttps://%s%s，然后保存并按页面提示重启。\n' "$C_BOLD" "$PUBLIC_DOMAIN" "$C_RESET"
+    printf '\n%s第 3 步：连接 MCP%s\n' "$C_BOLD" "$C_RESET"
+    printf '  最终 MCP 地址：%shttps://%s/mcp%s\n' "$C_BOLD" "$PUBLIC_DOMAIN" "$C_RESET"
+    printf '  在 Dashboard → ⑥ MCP 配置中复制客户端配置并完成授权。\n'
+    if ((!CADDY_READY)); then
+      printf '\n%s%s证书尚未就绪，但 Ombre Brain 已安装成功并可通过 SSH 使用。%s\n' "$C_BOLD" "$C_YELLOW" "$C_RESET"
+      printf '  请检查：A 记录是否仍指向本机、云安全组/防火墙是否放行入站 TCP 80/443。\n'
+      printf '  修正后运行：%sombrectl restart%s；诊断：%sombrectl doctor%s\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+      printf '  Caddy 日志：%ssudo docker logs --tail 100 %s%s\n' "$C_BOLD" "$CADDY_CONTAINER_NAME" "$C_RESET"
+    fi
   fi
   if [[ "$ACCESS_MODE" == "public_secure" ]]; then
     printf '\n%s%s公网安全连接：请按下面步骤操作%s\n' "$C_BOLD" "$C_YELLOW" "$C_RESET"
@@ -1828,11 +2360,16 @@ install_command() {
   ensure_sudo
   inspect_docker_status
   validate_network_access
+  validate_caddy_preflight
   show_install_summary
   confirm "确认执行以上安装吗？" yes || die "已取消，未改动系统。"
 
   ensure_docker
   ensure_required_tools
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    validate_caddy_container_ownership \
+      || die "请改名或移走冲突容器 $CADDY_CONTAINER_NAME 后重试。"
+  fi
   refuse_orphaned_adoption_backup
   if container_exists; then
     selected_data=$DATA_DIR
@@ -1850,6 +2387,7 @@ install_command() {
   else
     prepare_source_mode
   fi
+  prepare_caddy_network_assets
   write_environment "$existing_env" "$keep_password" "$keep_models"
   INSTALLED="0"
   write_state
@@ -1872,6 +2410,12 @@ install_command() {
   INSTALLED="1"
   write_state
   finish_adoption
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    if ! start_managed_caddy 180 1; then
+      warn "Ombre Brain 已安装并通过健康检查，但 Caddy 暂未取得 HTTPS 证书。"
+      warn "主服务会保留运行；修正 DNS/80/443 后执行 ombrectl restart 即可重试。"
+    fi
+  fi
   post_install_instructions
 }
 
@@ -1962,6 +2506,13 @@ update_command() {
   require_installation
   acquire_lock
   ensure_docker
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    prepare_caddy_network_assets
+    if ((CADDY_TRUST_CHANGED)); then
+      write_environment "$ENV_FILE" 1 1
+      write_state
+    fi
+  fi
   old_image="$(capture_current_image || true)"
   image_ref="$(capture_current_image_ref || true)"
   if [[ -z "$image_ref" || "$image_ref" == *@* || "$image_ref" == sha256:* ]]; then
@@ -2030,6 +2581,9 @@ update_command() {
   fi
   refresh_manager_after_update
   write_state
+  if [[ "$ACCESS_MODE" == "public_caddy" ]] && ! start_managed_caddy 90 0; then
+    warn "Ombre Brain 更新成功且健康，但 Caddy HTTPS 复检失败；请运行 ombrectl doctor。"
+  fi
   success "更新完成。vault 未移动：$DATA_DIR"
 }
 
@@ -2046,7 +2600,7 @@ restore_configuration_snapshot() {
 }
 
 configure_command() {
-  local old_env old_state old_data
+  local old_env old_state old_data old_access
   local keep_password=0 keep_models=0 default_access=1 choice new_data
   require_installation
   setup_prompt_fd
@@ -2058,13 +2612,15 @@ configure_command() {
   copy_privileged_file "$ENV_FILE" "$old_env"
   cp -- "$STATE_FILE" "$old_state"
   old_data=$DATA_DIR
+  old_access=$ACCESS_MODE
 
   collect_port "$PORT" 1
   case "$ACCESS_MODE" in
     local) default_access=1 ;;
     lan) default_access=2 ;;
-    public_secure) default_access=3 ;;
-    advanced) default_access=4 ;;
+    public_caddy) default_access=3 ;;
+    public_secure) default_access=4 ;;
+    advanced) default_access=5 ;;
   esac
   collect_access_mode "$default_access"
   prompt_line new_data "永久记忆目录（留空表示保持）" "$DATA_DIR"
@@ -2104,9 +2660,12 @@ configure_command() {
   validate_memory
   PREFLIGHT_NETWORK="现有安装，未重新请求外网"
   ensure_sudo
+  validate_caddy_preflight
   show_install_summary
   confirm "应用配置并重建容器吗？" yes || die "已取消，现有配置未改动。"
+  ensure_required_tools
   prepare_reconfigured_data_dir
+  prepare_caddy_network_assets
   if ! write_environment "$ENV_FILE" "$keep_password" "$keep_models"; then
     restore_configuration_snapshot "$old_env" "$old_state" 0 || true
     die "写入新环境文件失败，已恢复旧配置。"
@@ -2134,11 +2693,22 @@ configure_command() {
   if [[ "$old_data" != "$DATA_DIR" ]]; then
     success "已切换 vault；旧目录仍保留：$old_data"
   fi
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    if ! start_managed_caddy 180 1; then
+      warn "新配置已生效且 Ombre Brain 健康，但 Caddy 暂未取得 HTTPS 证书。"
+      warn "修正 DNS/80/443 后执行 ombrectl restart 即可重试。"
+    fi
+  elif [[ "$old_access" == "public_caddy" ]] || managed_caddy_exists; then
+    remove_managed_caddy \
+      || die "Ombre Brain 配置已应用，但旧 Caddy 公网入口未能移除。请立即运行：sudo docker rm -f $CADDY_CONTAINER_NAME"
+    remove_managed_caddy_network
+    success "已关闭并移除 ombrectl 管理的 Caddy 公网入口。"
+  fi
   post_install_instructions configure
 }
 
 status_command() {
-  local health="不可达" health_color="$C_RED" version="未知" host body=""
+  local health="不可达" health_color="$C_RED" version="未知" host body="" caddy_health="不可达"
   require_installation
   ensure_docker
   printf '\n%s%sOmbre Brain 状态%s\n' "$C_BOLD" "$C_GREEN" "$C_RESET"
@@ -2146,6 +2716,9 @@ status_command() {
   printf '  %sCompose%s：%s%s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$C_CYAN" "$COMPOSE_FILE" "$C_RESET"
   printf '  %sVault%s：%s%s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$C_CYAN" "$DATA_DIR" "$C_RESET"
   printf '  %s地址%s：%s%s:%s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$C_CYAN" "$BIND_ADDRESS" "$PORT" "$C_RESET"
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    printf '  %s公网 HTTPS%s：%shttps://%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD$C_CYAN" "$PUBLIC_DOMAIN" "$C_RESET"
+  fi
   printf '\n%s%s容器状态%s\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
   compose_run ps
   host="$(health_host)"
@@ -2163,10 +2736,23 @@ status_command() {
   printf '\n%s%s服务检查%s\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
   printf '  %s健康%s：%s%s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$health_color" "$health" "$C_RESET"
   printf '  %s版本%s：%s%s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$C_CYAN" "$version" "$C_RESET"
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    printf '\n%s%sCaddy 状态%s\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
+    if [[ -f "$(caddy_compose_file)" ]]; then
+      caddy_compose_run ps || true
+    else
+      warn "缺少 Caddy Compose 文件：$(caddy_compose_file)"
+    fi
+    body="$(fetch_caddy_health 2>/dev/null || true)"
+    if [[ "$body" == *'"status":"ok"'* || "$body" == *'"status": "ok"'* ]]; then
+      caddy_health="正常（证书和反向代理均可用）"
+    fi
+    printf '  %sHTTPS%s：%s%s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$C_CYAN" "$caddy_health" "$C_RESET"
+  fi
 }
 
 doctor_command() {
-  local failures=0 mount_source="" mode="" perms="" available=""
+  local failures=0 mount_source="" mode="" perms="" available="" caddy_body="" caddy_subnet=""
   local -a repair_hints=()
   require_installation
   detect_platform
@@ -2219,6 +2805,60 @@ doctor_command() {
     repair_hints+=("ombrectl logs")
     failures=$((failures + 1))
   fi
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    info "检查 Caddy 自动 HTTPS"
+    if ! managed_caddy_network_exists; then
+      error "Caddy 专用 Docker 网络缺失或不属于 ombrectl：$CADDY_NETWORK_NAME"
+      repair_hints+=("ombrectl start")
+      failures=$((failures + 1))
+    else
+      caddy_subnet="$(caddy_network_ipv4_subnet || true)"
+      if [[ -z "$caddy_subnet" || ",$TRUSTED_PROXY_CIDRS," != *",$caddy_subnet,"* ]]; then
+        error "应用未精确信任当前 Caddy 专用网络：${caddy_subnet:-未知}"
+        repair_hints+=("ombrectl configure")
+        failures=$((failures + 1))
+      else
+        success "Caddy 可信代理网络一致：$caddy_subnet"
+      fi
+    fi
+    if [[ ! -f "$(caddy_compose_file)" || ! -f "$(caddy_config_file)" ]]; then
+      error "Caddy 受管理配置文件缺失。"
+      repair_hints+=("ombrectl configure")
+      failures=$((failures + 1))
+    elif ! grep -q '^# managed-by=ombrectl$' "$(caddy_compose_file)" \
+        || ! grep -q '^# managed-by=ombrectl$' "$(caddy_config_file)"; then
+      error "Caddy 配置缺少 ombrectl 管理标记，拒绝自动接管。"
+      repair_hints+=("人工检查 $(caddy_compose_file) 和 $(caddy_config_file)")
+      failures=$((failures + 1))
+    elif ! caddy_compose_run config --quiet; then
+      error "Caddy Compose 配置无效。"
+      repair_hints+=("ombrectl configure")
+      failures=$((failures + 1))
+    fi
+    if caddy_container_exists && ! managed_caddy_exists; then
+      error "容器 $CADDY_CONTAINER_NAME 不属于 ombrectl，存在名称冲突。"
+      repair_hints+=("sudo docker inspect $CADDY_CONTAINER_NAME")
+      failures=$((failures + 1))
+    elif ! managed_caddy_running; then
+      error "Caddy 受管理容器未运行。"
+      repair_hints+=("ombrectl start")
+      failures=$((failures + 1))
+    else
+      success "Caddy 受管理容器正在运行。"
+    fi
+    caddy_body="$(fetch_caddy_health 2>/dev/null || true)"
+    if [[ "$caddy_body" == *'"status":"ok"'* || "$caddy_body" == *'"status": "ok"'* ]]; then
+      success "HTTPS 证书和反向代理可用：https://$PUBLIC_DOMAIN"
+    else
+      error "本机 TLS 校验失败：https://$PUBLIC_DOMAIN/health"
+      repair_hints+=("检查域名 A 记录、入站 TCP 80/443 和日志：sudo docker logs --tail 100 $CADDY_CONTAINER_NAME")
+      failures=$((failures + 1))
+    fi
+  elif managed_caddy_running; then
+    error "当前不是 Caddy 模式，但旧的受管理 Caddy 仍在运行，公网入口可能尚未关闭。"
+    repair_hints+=("sudo docker stop $CADDY_CONTAINER_NAME")
+    failures=$((failures + 1))
+  fi
   if "${DOCKER[@]}" container inspect "$ADOPT_BACKUP_NAME" >/dev/null 2>&1; then
     error "发现未清理的接管备份容器：$ADOPT_BACKUP_NAME"
     repair_hints+=("sudo docker inspect $ADOPT_BACKUP_NAME")
@@ -2243,17 +2883,31 @@ start_command() {
   require_installation
   acquire_lock
   ensure_docker
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    prepare_caddy_network_assets
+    if ((CADDY_TRUST_CHANGED)); then
+      write_environment "$ENV_FILE" 1 1
+      write_state
+    fi
+  fi
   if ! compose_run up -d ombre-brain; then
     show_failure_details
     die "启动失败。可复制运行：ombrectl doctor"
   fi
   health_check 90 || die "启动后健康检查失败。"
+  if [[ "$ACCESS_MODE" == "public_caddy" ]] && ! start_managed_caddy 180 0; then
+    die "Ombre Brain 已启动，但 Caddy HTTPS 未就绪。请检查 DNS、入站 TCP 80/443 和：sudo docker logs --tail 100 $CADDY_CONTAINER_NAME"
+  fi
 }
 
 stop_command() {
   require_installation
   acquire_lock
   ensure_docker
+  if managed_caddy_exists; then
+    stop_managed_caddy \
+      || die "Caddy 停止失败；为避免公网入口继续工作，尚未停止 Ombre Brain。"
+  fi
   compose_run stop ombre-brain \
     || die "停止失败。请运行：ombrectl status；然后运行：ombrectl logs"
   success "服务已停止；vault 未改动。"
@@ -2263,11 +2917,26 @@ restart_command() {
   require_installation
   acquire_lock
   ensure_docker
-  if ! compose_run restart ombre-brain; then
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    prepare_caddy_network_assets
+    if ((CADDY_TRUST_CHANGED)); then
+      write_environment "$ENV_FILE" 1 1
+      write_state
+    fi
+  fi
+  if [[ "$ACCESS_MODE" == "public_caddy" ]]; then
+    compose_run up -d --force-recreate ombre-brain || {
+      show_failure_details
+      die "重建 Ombre Brain 失败。可复制运行：ombrectl doctor"
+    }
+  elif ! compose_run restart ombre-brain; then
     show_failure_details
     die "重启失败。可复制运行：ombrectl doctor"
   fi
   health_check 90 || die "重启后健康检查失败。"
+  if [[ "$ACCESS_MODE" == "public_caddy" ]] && ! start_managed_caddy 180 0; then
+    die "Ombre Brain 已重启且健康，但 Caddy HTTPS 未就绪。请检查 DNS、入站 TCP 80/443 和 Caddy 日志。"
+  fi
 }
 
 safe_remove_app_dir() {
@@ -2313,9 +2982,9 @@ uninstall_command() {
     offline_cleanup=1
   fi
   if ((offline_cleanup)); then
-    printf '\n将只清理 ombrectl 和受管理的本机文件；无法验证或停止 Docker 容器。\n'
+    printf '\n将只清理 ombrectl 和受管理的本机文件；无法验证或停止 Ombre Brain/Caddy 容器。\n'
   else
-    printf '\n将停止并移除 Ombre Brain 容器和受管理的程序文件。\n'
+    printf '\n将停止并移除 Ombre Brain、ombrectl 管理的 Caddy 容器和受管理的程序文件。\n'
   fi
   printf 'vault 永久保留：%s\n' "$DATA_DIR"
   printf '不会执行 docker compose down -v，也不会删除任何记忆。\n'
@@ -2326,8 +2995,15 @@ uninstall_command() {
     "删除 /etc 中的环境密钥；保留无密钥恢复状态"
 
   if ((docker_available)); then
+    if managed_caddy_exists; then
+      remove_managed_caddy \
+        || die "受管理 Caddy 容器移除失败，已停止卸载。请运行：sudo docker inspect $CADDY_CONTAINER_NAME"
+    elif caddy_container_exists; then
+      warn "同名 Caddy 容器不属于 ombrectl，未停止或删除：$CADDY_CONTAINER_NAME"
+    fi
     compose_run down --remove-orphans \
       || die "容器移除失败，已停止卸载以保留恢复文件。请运行：ombrectl doctor"
+    remove_managed_caddy_network
   fi
   if [[ -L "$BIN_LINK" ]]; then
     link_target="$(readlink "$BIN_LINK" || true)"
@@ -2346,6 +3022,7 @@ uninstall_command() {
   if ((offline_cleanup)); then
     warn "安装器文件已清理，但由于 Docker 不可用，容器状态未经验证。"
     warn "Docker 修复后请运行：sudo docker inspect $CONTAINER_NAME && sudo docker rm -f $CONTAINER_NAME"
+    warn "若曾启用 Caddy，还需检查：sudo docker inspect $CADDY_CONTAINER_NAME"
     success "vault 仍完整保留：$DATA_DIR"
   else
     success "运行环境已卸载。vault 仍完整保留：$DATA_DIR"
@@ -2394,13 +3071,13 @@ Ombre Brain 一键安装器 / 生命周期管理器
 命令：
   install      交互式首次安装（默认预构建镜像）
   update       更新镜像或源码，健康失败时回滚运行镜像
-  configure    修改端口、访问方式、密码、vault 或模型配置
-  status       显示容器、版本和健康状态
-  doctor       检查 Compose、权限、持久挂载、磁盘和健康
+  configure    修改端口、访问方式/域名、密码、vault 或模型配置
+  status       显示容器、版本、应用和 HTTPS 健康状态
+  doctor       检查 Compose、权限、持久挂载、磁盘、Caddy 和健康
   logs         跟踪脱敏容器日志
-  start        启动服务并检查健康
-  stop         停止服务，不删除容器或数据
-  restart      重启服务并检查健康
+  start        启动应用及受管理 Caddy，并检查健康
+  stop         停止应用及受管理 Caddy，不删除容器或数据
+  restart      重启应用及受管理 Caddy，并检查健康
   uninstall    移除运行环境；永不删除 vault
   help         显示本帮助
 

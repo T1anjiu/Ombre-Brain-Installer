@@ -76,13 +76,38 @@ http://SERVER_PUBLIC_IP:18001/mcp
 2. **可信局域网客户端**：运行 `ombrectl configure`，选择“可信局域网（0.0.0.0）”，只允许
    可信网段访问防火墙端口，再使用 `http://服务器局域网IP:18001/mcp`。不要把它直接暴露到互联网。
 3. **claude.ai 或其他云端 MCP 客户端**：云端服务不能访问你的 `127.0.0.1`，也不建议用公网 IP
-   加明文 HTTP。先通过 SSH 进入 Dashboard，配置内置 Cloudflare Tunnel，在 `/onboarding` 选择
-   “公网安全”，最后使用 Dashboard“⑥ MCP 配置”生成的 `https://域名/mcp` 地址。
+   加明文 HTTP。安装时选择“公网自动 HTTPS（Caddy）”，让安装器申请证书；在 `/onboarding`
+   选择“公网安全”，最后使用 Dashboard“⑥ MCP 配置”生成的 `https://域名/mcp` 地址。已有
+   Cloudflare 账号的用户也可以继续选择 Tunnel。
 
-### 小白公网安全教程（Cloudflare Tunnel）
+### 小白公网安全教程（Caddy 自动 HTTPS，推荐）
 
-如果你要让 claude.ai 等云端客户端连接，请严格按下面顺序操作。安装器默认仍只监听
-`127.0.0.1`，不会把 Ombre Brain 端口直接暴露到公网。
+Caddy 本身免费，不需要注册 Cloudflare、绑定银行卡或购买证书。你只需要一台带公网 IPv4 的 VPS
+和一个自己能修改 DNS 的域名。Ombre Brain 仍只监听 `127.0.0.1`，公网只开放标准 HTTPS 入口。
+
+安装前先完成两件事：
+
+1. 在域名服务商添加 **A 记录**，例如把 `brain.example.com` 指向这台 VPS 的公网 IPv4；等待解析生效。
+   如果 DNS 恰好托管在 Cloudflare，请先设为灰云 **DNS only**，不要让代理地址替代 VPS 的真实 A 记录。
+2. 在云厂商安全组和服务器防火墙中放行入站 **TCP 80 和 443**。应用端口 `18001` 不需要对公网开放。
+
+运行安装器后选择“公网自动 HTTPS（VPS + 自有域名，Caddy，推荐）”，输入域名。安装器会检查 A
+记录和本机端口占用，启动独立的 Caddy 容器，并自动申请和续期 HTTPS 证书。成功后：
+
+1. 打开 `https://你的域名` 登录 Dashboard；
+2. 打开 `https://你的域名/onboarding`，选择“公网安全模式”，公网地址填写同一个
+   `https://你的域名`，保存并按页面提示重启；
+3. 到 Dashboard → **⑥ MCP 配置**，复制 `https://你的域名/mcp` 并添加到客户端。
+
+若证书暂时申请失败，Ombre Brain 不会被卸载或停止，仍可通过 SSH 转发访问。先运行
+`ombrectl doctor`，再检查 A 记录、TCP 80/443 和 `sudo docker logs --tail 100 ombre-brain-caddy`；
+修正后执行 `ombrectl restart` 会自动重试。若 80/443 已由自己的 Nginx/Caddy 占用，请使用
+“高级自定义绑定”，安装器不会覆盖现有反向代理。
+
+### 备选公网教程（Cloudflare Tunnel）
+
+如果你已经有可用的 Cloudflare 账号及托管域名，也可以选择 Tunnel。安装器仍只监听
+`127.0.0.1`，不会把 Ombre Brain 应用端口直接暴露到公网。
 
 1. **准备 Cloudflare**：在自己的电脑浏览器打开 <https://one.dash.cloudflare.com>，登录或注册
    Cloudflare，并确认要使用的域名已经添加并托管在 Cloudflare。
@@ -123,7 +148,10 @@ ombrectl logs         # 查看脱敏日志，按 Ctrl+C 退出
 ombrectl uninstall    # 卸载容器和程序，永久保留记忆数据
 ```
 
-安装器不会自动修改防火墙、DNS、反向代理或 HTTPS，也不会执行 `docker compose down -v`。卸载后 `/var/lib/ombre-brain` 始终保留。
+Caddy 模式会创建一个由 `ombrectl` 独占管理的反向代理容器，并自动申请、续期 HTTPS 证书；
+安装器不会修改 DNS、云安全组、防火墙或用户已有的 Nginx/Caddy。其他接入模式不会自动配置
+反向代理或 HTTPS。安装器不会执行 `docker compose down -v`，卸载后 `/var/lib/ombre-brain`
+始终保留。
 
 ## 更新来源
 
@@ -137,7 +165,7 @@ ombrectl uninstall    # 卸载容器和程序，永久保留记忆数据
 
 ```text
 /opt/ombre-brain       程序和 Compose
-/etc/ombre-brain       安装状态与密钥
+/etc/ombre-brain       安装状态、密钥与受管理 Caddyfile
 /var/lib/ombre-brain   永久记忆和配置
 /usr/local/bin/ombrectl 全局命令
 ```

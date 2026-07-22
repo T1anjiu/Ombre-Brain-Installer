@@ -54,6 +54,7 @@ wget -qO /tmp/ombre-install.sh https://raw.githubusercontent.com/T1anjiu/Ombre-B
 | `/opt/ombre-brain` | 生命周期脚本和 Compose；自动克隆源码时也放在这里 |
 | `/etc/ombre-brain/ombre.env` | 密码与终端托管的 provider 密钥，权限固定为 `0600` |
 | `/etc/ombre-brain/install.conf` | 不含密钥的安装状态；按白名单解析，不执行其中内容 |
+| `/etc/ombre-brain/caddy/Caddyfile` | 仅在 Caddy 模式生成；通过专用 Docker 网络反代 Ombre Brain |
 | `/var/lib/ombre-brain` | `config.yaml`、Markdown、索引及其他永久 vault 数据 |
 | `/usr/local/bin/ombrectl` | 全局管理入口 |
 
@@ -67,8 +68,9 @@ ombrectl update
 ombrectl uninstall
 ```
 
-所有 Compose 调用都固定使用隔离项目名 `ombre-brain-managed`，并显式传入
-`--env-file /etc/ombre-brain/ombre.env`。旧入口 `deploy/deploy.sh` 只是兼容包装器；
+Ombre Brain 的 Compose 调用固定使用隔离项目名 `ombre-brain-managed`，并显式传入
+`--env-file /etc/ombre-brain/ombre.env`。Caddy 模式另用 `ombre-brain-caddy-managed` 项目和
+`ombre-brain-caddy` 容器，避免影响应用回滚或用户自己的代理。旧入口 `deploy/deploy.sh` 只是兼容包装器；
 新部署和运维应直接使用 `install.sh` / `ombrectl`。
 
 ### 访问方式
@@ -79,16 +81,59 @@ ombrectl uninstall
   把 `203.0.113.10` 换成服务器 IP。保持该 SSH 窗口开启，然后用自己电脑的浏览器打开
   `http://127.0.0.1:18001`。若安装时改了端口，请把命令和浏览器地址中的 `18001` 一并替换。
 - 可信局域网模式绑定 `0.0.0.0`。安装器不会开放端口；应由管理员只允许可信网段访问。
-- 公网安全模式仍绑定回环地址。先通过 SSH 登录 Dashboard，配置内置 Cloudflare
-  Tunnel，再到 `/onboarding` 选择“公网安全”。claude.ai 等云端客户端无法访问本机
-  `127.0.0.1`，必须先完成这一步并使用生成的 HTTPS `/mcp` 地址。
+- Caddy 公网模式仍让 Ombre Brain 绑定 `127.0.0.1`。安装器生成独立 Compose/Caddyfile，
+  让 Caddy 监听 80/443、自动申请和续期证书，再反代到应用端口。它不需要 Cloudflare 账号、
+  银行卡或付费证书；用户必须自己拥有域名、把 A 记录指向 VPS 公网 IPv4，并在云安全组/防火墙
+  放行入站 TCP 80/443。
+- Cloudflare Tunnel 模式仍绑定回环地址，供已经有 Cloudflare 账号和托管域名的用户选择。
+  先通过 SSH 登录 Dashboard 配置内置 Tunnel，再到 `/onboarding` 选择“公网安全”。
 - 高级模式只接受明确的 IPv4 绑定和最后一跳代理 CIDR，不安装 Caddy/nginx、不申请证书，
-  并拒绝把 `0.0.0.0/0` 或 `::/0` 设为可信代理。
+  不改用户已有的反向代理，并拒绝把 `0.0.0.0/0` 或 `::/0` 设为可信代理。
 
-#### 公网安全模式：Cloudflare Tunnel 手把手流程
+#### 公网自动 HTTPS：Caddy 模式
 
-安装器选择“公网安全”后，服务仍然只监听 `127.0.0.1`。下面的 Tunnel 是唯一把指定域名
-安全转发到本机服务的步骤，请按顺序完成：
+选择 Caddy 模式时，安装器先规范化域名，只接受域名或 `https://域名[/mcp]`，拒绝裸 IP、
+自定义端口、明文 `http://`、凭据和额外路径。随后检查：
+
+- 域名存在 A 记录；能探测公网 IPv4 时，所有 A 记录都必须指向本机公网地址；
+- TCP 80/443 没有被其他服务占用；已经运行且标签匹配的 ombrectl Caddy 除外；
+- 固定容器名没有被不属于安装器的容器占用。
+
+若 DNS 托管在 Cloudflare，预检时应暂时使用灰云 **DNS only**；橙云代理解析到的是 Cloudflare
+边缘地址，不是本机公网 IPv4，会被单机 Caddy 预检拒绝。
+
+安装器不会自动修改 DNS、iptables/firewalld/ufw 或云安全组。预检通过后生成：
+
+```text
+/opt/ombre-brain/caddy-compose.yaml
+/opt/ombre-brain/caddy-app-network.override.yaml
+/etc/ombre-brain/caddy/Caddyfile
+```
+
+Caddy 与 Ombre Brain 只额外挂到标签受控的专用网络 `ombre-brain-caddy-managed-proxy`，并通过
+`ombre-brain:8000` 通信；只有 Caddy 发布 80/443，应用宿主端口仍只绑定回环地址。安装器读取
+该专用网络的实际 IPv4 子网并加入 `OMBRE_TRUSTED_PROXY_CIDRS`，不会信任默认 Docker 网络或
+`0.0.0.0/0`。Caddy 自动设置标准 `X-Forwarded-*` 请求头，并为长连接关闭反代刷新缓冲。
+
+Ombre Brain 必须先通过本机健康检查，安装器才启动 Caddy。随后安装器使用
+`curl --resolve 域名:443:127.0.0.1` 在本机验证真实证书、SNI 和 `/health` 反代链路。证书签发
+失败不会回滚或停止已经健康的 Ombre Brain；Caddy 保持重试，可先用 SSH 转发访问，再按顺序检查：
+
+```bash
+ombrectl doctor
+sudo docker logs --tail 100 ombre-brain-caddy
+# 修正 A 记录、TCP 80/443 后
+ombrectl restart
+```
+
+切换离开 Caddy 模式时，`ombrectl configure` 只移除带安装器标签的 Caddy 容器和不再占用的
+专用网络，不会触碰用户自己的 Nginx/Caddy。证书数据使用独立命名卷保留，安装器永不执行
+`down -v`，避免重装时重复触发 CA 速率限制。
+
+#### 备选公网模式：Cloudflare Tunnel 手把手流程
+
+安装器选择“Cloudflare Tunnel”后，服务仍然只监听 `127.0.0.1`。若采用这个备选方案，
+请按下面顺序把指定域名安全转发到本机服务：
 
 1. 在自己的电脑浏览器打开 <https://one.dash.cloudflare.com>，登录 Cloudflare；确认准备使用
    的域名已经添加并托管在 Cloudflare。
@@ -115,7 +160,7 @@ ombrectl uninstall
 不要把 `http://服务器公网IP:18001/mcp` 当作默认公网 MCP 地址。默认回环绑定会让该地址无法
 从互联网连接；即使把端口开放到公网，MCP 远程 OAuth 也应使用 HTTPS 域名而不是裸 IP 明文 HTTP。
 本机或 SSH 转发客户端使用 `http://127.0.0.1:18001/mcp`，可信局域网客户端使用绑定后的局域网 IP，
-claude.ai 等云端客户端则必须使用 Cloudflare Tunnel 或其他明确配置的 HTTPS 反向代理地址。
+claude.ai 等云端客户端则必须使用 Caddy、Cloudflare Tunnel 或其他明确配置的 HTTPS 反向代理地址。
 
 ### 配置来源与优先级
 
@@ -154,8 +199,8 @@ curl -i http://服务器公网IP:18001/health
 ### 开机自启策略
 
 安装器不注册单独的 `ombre-brain.service`。systemd 负责启用和启动 Docker daemon，
-Ombre Brain 容器由 Compose 中的 `restart: unless-stopped` 策略恢复。因此服务器重启后，
-Docker 启动时会恢复此前正常运行的容器；执行 `ombrectl stop` 明确停止过容器后，应运行
+Ombre Brain 容器与受管理的 Caddy 容器都由 Compose 中的 `restart: unless-stopped` 策略恢复。
+因此服务器重启后，Docker 启动时会恢复此前正常运行的容器；执行 `ombrectl stop` 明确停止过容器后，应运行
 `ombrectl start` 才会再次启动。可用以下命令核对：
 
 ```bash
@@ -196,8 +241,9 @@ ombrectl logs
 
 ### 卸载与恢复
 
-`ombrectl uninstall` 需要输入 `UNINSTALL`。它只执行不带 `-v` 的 Compose `down`，删除受
-管理标记保护的程序目录和自身命令；永远不提供删除 vault 的选项。可选择：
+`ombrectl uninstall` 需要输入 `UNINSTALL`。它移除 Ombre Brain 容器以及标签匹配的受管理
+Caddy 容器，再执行不带 `-v` 的 Compose `down`，删除受管理标记保护的程序目录和自身命令；
+不会删除 Caddy 证书命名卷，也永远不提供删除 vault 的选项。可选择：
 
 1. 保留 `/etc/ombre-brain` 的全部配置，便于原样重装；
 2. 删除 `ombre.env` 中的环境密钥，但保留不含密钥的 `install.conf` 恢复状态。
@@ -328,7 +374,7 @@ docker compose -f deploy/docker-compose.yml up -d --build --force-recreate
 ## 访问控制
 
 - Dashboard 会话默认 30 天过期，可通过 `OMBRE_DASHBOARD_SESSION_DAYS` 调整为 1-365 天。认证文件与 token 文件使用原子写入，并在支持的系统上限制为仅文件所有者可读写。
-- 登录和 OAuth 授权共用失败限流。`X-Forwarded-For` / `X-Forwarded-Proto` / `X-Forwarded-Host` 只在请求确实来自可信反代时采用；内置 Tunnel 使用回环地址，外置 nginx/Caddy/容器反代应通过 `OMBRE_TRUSTED_PROXY_CIDRS` 添加直接连接 OB 的最后一跳代理 CIDR，不能使用 `0.0.0.0/0`。三个官方 Compose 模板都会把该变量从 `.env` 传入容器。
+- 登录和 OAuth 授权共用失败限流。`X-Forwarded-For` / `X-Forwarded-Proto` / `X-Forwarded-Host` 只在请求确实来自可信反代时采用；内置 Tunnel 使用回环地址，安装器管理的 Caddy 使用标签受控的独立 Docker 网络，安装器只追加该网络的实际 CIDR。外置 nginx/Caddy/容器反代应通过 `OMBRE_TRUSTED_PROXY_CIDRS` 添加直接连接 OB 的最后一跳代理 CIDR，不能使用 `0.0.0.0/0`。三个官方 Compose 模板都会把该变量从 `.env` 传入容器。
 - 内置 JSON OAuth 状态按单进程部署设计。官方 Docker/Render 启动方式使用单 worker；自行部署时不要启动多个 Web worker 或多个共享同一数据卷的副本，否则授权状态不具备跨进程事务保证。
 - `limits.max_management_request_bytes` 限制普通 Dashboard/OAuth 写请求；导入文本和迁移 ZIP 仍使用各自更大的流式上限。
 - `/api/update-info` 包含数据目录和容器信息，因此需要 Dashboard 登录；公开健康检查仅使用 `/health` 和 `/api/version`。
