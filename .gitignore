@@ -1,0 +1,15 @@
+# Local installer/runtime artifacts
+graphify-out/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# Local secrets and state accidentally copied into the repository
+.env
+*.env
+install.conf
+ombre.env
+
+# Temporary files
+*.tmp
+*.bak
