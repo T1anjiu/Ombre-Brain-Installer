@@ -6,12 +6,31 @@
 
 支持 Ubuntu / Debian、Fedora / RHEL / CentOS / Rocky / AlmaLinux，架构为 `amd64` 或 `arm64`。
 
+如果系统提示 `curl: command not found`，先按发行版安装 `curl` 和 HTTPS 证书包。只需要更新软件索引，不需要先执行整机 `upgrade`：
+
+```bash
+# Ubuntu / Debian
+sudo apt-get update
+sudo apt-get install -y curl ca-certificates
+```
+
+```bash
+# Fedora / RHEL / CentOS / Rocky / AlmaLinux
+sudo dnf install -y curl ca-certificates
+```
+
+如果系统没有 `dnf` 但提供 `yum`，使用：
+
+```bash
+sudo yum install -y curl ca-certificates
+```
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/T1anjiu/Ombre-Brain-Installer/main/install.sh \
   -o /tmp/ombre-install.sh && bash /tmp/ombre-install.sh
 ```
 
-没有 `curl` 时，先按发行版安装 `curl`，再重新执行上面的命令。安装器会交互式检查 Docker、Compose v2、磁盘、内存、端口和网络，并在执行前展示完整摘要。
+安装器随后会交互式检查 Docker、Compose v2、磁盘、内存、端口和网络，并在执行前展示完整摘要。
 
 默认配置：
 
