@@ -651,8 +651,12 @@ ensure_docker_autostart() {
     return 0
   }
   if systemctl list-unit-files docker.service --no-legend 2>/dev/null | grep -q '^docker\.service'; then
-    run_root systemctl enable --now docker.service \
-      || die "无法启用 Docker 开机启动。请运行：sudo systemctl enable --now docker"
+    if ((DRY_RUN)); then
+      run_root systemctl enable --now docker.service
+    else
+      run_root systemctl enable --now docker.service >/dev/null 2>&1 \
+        || die "无法启用 Docker 开机启动。请运行：sudo systemctl enable --now docker"
+    fi
   elif [[ -d /run/systemd/system ]]; then
     warn "未找到 docker.service；当前 Docker 可能是 rootless/非标准安装，安装器无法保证重启后自动恢复。"
   fi
@@ -2110,12 +2114,15 @@ configure_command() {
 }
 
 status_command() {
-  local health="不可达" version="未知" host body=""
+  local health="不可达" health_color="$C_RED" version="未知" host body=""
   require_installation
   ensure_docker
-  printf '%sOmbre Brain 状态%s\n' "$C_BOLD" "$C_RESET"
-  printf '  模式：%s\n  Compose：%s\n  Vault：%s\n  地址：%s:%s\n' \
-    "$MODE" "$COMPOSE_FILE" "$DATA_DIR" "$BIND_ADDRESS" "$PORT"
+  printf '\n%s%sOmbre Brain 状态%s\n' "$C_BOLD" "$C_GREEN" "$C_RESET"
+  printf '  %s模式%s：%s%s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$C_CYAN" "$MODE" "$C_RESET"
+  printf '  %sCompose%s：%s%s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$C_CYAN" "$COMPOSE_FILE" "$C_RESET"
+  printf '  %sVault%s：%s%s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$C_CYAN" "$DATA_DIR" "$C_RESET"
+  printf '  %s地址%s：%s%s:%s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$C_CYAN" "$BIND_ADDRESS" "$PORT" "$C_RESET"
+  printf '\n%s%s容器状态%s\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
   compose_run ps
   host="$(health_host)"
   body="$(fetch_url "http://$host:$PORT/health" 2>/dev/null || true)"
@@ -2123,11 +2130,15 @@ status_command() {
     version="$(fetch_url "http://$host:$PORT/api/version" 2>/dev/null || true)"
     if printf '%s' "$version" | grep -Eq '"version"[[:space:]]*:[[:space:]]*"[^"]+"'; then
       health="正常"
+      health_color="$C_GREEN"
     else
       health="部分异常（版本接口不可用）"
+      health_color="$C_YELLOW"
     fi
   fi
-  printf '  健康：%s\n  版本：%s\n' "$health" "$version"
+  printf '\n%s%s服务检查%s\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
+  printf '  %s健康%s：%s%s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$health_color" "$health" "$C_RESET"
+  printf '  %s版本%s：%s%s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$C_CYAN" "$version" "$C_RESET"
 }
 
 doctor_command() {
