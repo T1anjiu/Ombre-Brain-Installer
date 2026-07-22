@@ -85,6 +85,33 @@ ombrectl uninstall
 - 高级模式只接受明确的 IPv4 绑定和最后一跳代理 CIDR，不安装 Caddy/nginx、不申请证书，
   并拒绝把 `0.0.0.0/0` 或 `::/0` 设为可信代理。
 
+#### 公网安全模式：Cloudflare Tunnel 手把手流程
+
+安装器选择“公网安全”后，服务仍然只监听 `127.0.0.1`。下面的 Tunnel 是唯一把指定域名
+安全转发到本机服务的步骤，请按顺序完成：
+
+1. 在自己的电脑浏览器打开 <https://one.dash.cloudflare.com>，登录 Cloudflare；确认准备使用
+   的域名已经添加并托管在 Cloudflare。
+2. 在自己的电脑（不是服务器）打开终端，执行安装完成摘要中显示的 `ssh -N -L ...` 命令。
+   保持这个窗口开启，然后打开 `http://127.0.0.1:18001` 进入服务器 Dashboard。端口被修改时，
+   将地址中的 `18001` 换成实际端口。
+3. 在 Cloudflare Zero Trust 进入 **Networks → Tunnels → Create a tunnel**，选择
+   **Cloudflared**，填写 Tunnel 名称并继续；在 **Install connector** 页面选择 **Docker**，
+   复制 `--token` 后面的长 Token（通常以 `eyJ` 开头）。
+4. 回到 Ombre Brain Dashboard → **设置 → Cloudflare Tunnel**，粘贴 Token，点击“保存 Token”，
+   再点击“启动”。等待状态变成绿色“已连接”；Token 只粘贴到自己的 Dashboard，不要发到聊天或工单。
+5. 回到 Cloudflare 刚创建的 Tunnel，打开 **Public Hostnames → Add a public hostname**：
+   Domain 填你的域名（例如 `ombre.example.com`）；Service Type 选 **HTTP**；URL 填
+   `localhost:8000`。保存后等待约 30 秒，并用浏览器打开该域名确认 Dashboard 可达。
+6. 在 Dashboard 地址栏打开 `/onboarding`，选择“公网安全模式”，填写完整 HTTPS 地址，例如
+   `https://ombre.example.com`。不能填写公网 IP，也不能填写 `http://`；保存并按页面提示重启。
+7. 打开 Dashboard → **⑥ MCP 配置**，复制生成的 `https://你的域名/mcp`，再添加到 claude.ai、
+   Claude Code 或其他支持 OAuth 的 MCP 客户端。
+
+排错顺序：先看 Tunnel 是否绿色“已连接”，再确认 Public Hostname 的域名和 `localhost:8000`，
+最后确认 `/onboarding` 中保存的是同一个 HTTPS 域名。云端 MCP 客户端不能使用
+`http://127.0.0.1:18001/mcp` 或服务器公网 IP 的明文 HTTP 地址。
+
 不要把 `http://服务器公网IP:18001/mcp` 当作默认公网 MCP 地址。默认回环绑定会让该地址无法
 从互联网连接；即使把端口开放到公网，MCP 远程 OAuth 也应使用 HTTPS 域名而不是裸 IP 明文 HTTP。
 本机或 SSH 转发客户端使用 `http://127.0.0.1:18001/mcp`，可信局域网客户端使用绑定后的局域网 IP，

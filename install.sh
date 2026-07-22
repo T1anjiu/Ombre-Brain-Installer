@@ -1734,7 +1734,31 @@ post_install_instructions() {
     printf '\n%s模型配置：%s由 /etc/ombre-brain/ombre.env 托管；请在 Dashboard 分别测试压缩和向量接口。%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
   fi
   if [[ "$ACCESS_MODE" == "public_secure" ]]; then
-    printf '\n%s%s公网安全引导：%s准备 Cloudflare 账号及已托管域名，再经 SSH 登录 Dashboard 配置内置 Tunnel，最后在 /onboarding 选择“公网安全”。%s\n' "$C_BOLD" "$C_YELLOW" "$C_RESET" "$C_RESET"
+    printf '\n%s%s公网安全连接：请按下面步骤操作%s\n' "$C_BOLD" "$C_YELLOW" "$C_RESET"
+    printf '%s第 1 步：准备 Cloudflare%s\n' "$C_BOLD" "$C_RESET"
+    printf '  在自己的电脑浏览器打开：%shttps://one.dash.cloudflare.com%s\n' "$C_BOLD" "$C_RESET"
+    printf '  登录或注册 Cloudflare，并确认你的域名已经添加到 Cloudflare。\n'
+    printf '\n%s第 2 步：通过 SSH 打开 Dashboard%s\n' "$C_BOLD" "$C_RESET"
+    printf '  在“自己的电脑”终端执行上面生成的 SSH 转发命令（不要在服务器里执行）。\n'
+    printf '  SSH 窗口保持开启，然后在浏览器打开：%shttp://127.0.0.1:%s%s\n' "$C_BOLD" "$PORT" "$C_RESET"
+    printf '\n%s第 3 步：在 Dashboard 粘贴 Tunnel Token%s\n' "$C_BOLD" "$C_RESET"
+    printf '  Dashboard → 设置 → Cloudflare Tunnel。\n'
+    printf '  回到 Cloudflare：Networks → Tunnels → Create a tunnel → Cloudflared。\n'
+    printf '  创建 Tunnel 后选择 Docker，在“Install connector”页面复制 --token 后的长 Token（通常以 eyJ 开头）。\n'
+    printf '  把 Token 粘贴到 Dashboard，点击“保存 Token”，再点击“启动”，等待状态变成绿色“已连接”。\n'
+    printf '\n%s第 4 步：在 Cloudflare 添加 Public Hostname%s\n' "$C_BOLD" "$C_RESET"
+    printf '  打开刚创建的 Tunnel → Public Hostnames → Add a public hostname。\n'
+    printf '  Domain：填写你的域名，例如 %sombre.example.com%s（这个域名必须在 Cloudflare 中）。\n' "$C_BOLD" "$C_RESET"
+    printf '  Service：选择 HTTP；URL：填写 %slocalhost:8000%s，然后保存。\n' "$C_BOLD" "$C_RESET"
+    printf '  等待约 30 秒，确认该域名可以打开 Dashboard。\n'
+    printf '\n%s第 5 步：在 /onboarding 选择公网安全%s\n' "$C_BOLD" "$C_RESET"
+    printf '  回到 Dashboard，打开地址栏中的 %s/onboarding%s。\n' "$C_BOLD" "$C_RESET"
+    printf '  选择“公网安全模式”，填写你的 HTTPS 地址，例如 %shttps://ombre.example.com%s。\n' "$C_BOLD" "$C_RESET"
+    printf '  只能填写 HTTPS 域名，不能填写公网 IP，也不能填写 http://，然后保存并按提示重启。\n'
+    printf '\n%s第 6 步：复制 HTTPS MCP 地址%s\n' "$C_BOLD" "$C_RESET"
+    printf '  打开 Dashboard → ⑥ MCP 配置，复制生成的地址：%shttps://你的域名/mcp%s。\n' "$C_BOLD" "$C_RESET"
+    printf '  把它添加到 claude.ai、Claude Code 或其他支持 OAuth 的 MCP 客户端。\n'
+    printf '  如果连接失败：先确认 Tunnel 为绿色“已连接”，再确认域名和 /onboarding 地址完全一致。\n'
   fi
   printf '\n%s%s常用命令%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
   printf '  %sombrectl status%s       查看状态\n' "$C_BOLD" "$C_RESET"

@@ -79,6 +79,32 @@ http://SERVER_PUBLIC_IP:18001/mcp
    加明文 HTTP。先通过 SSH 进入 Dashboard，配置内置 Cloudflare Tunnel，在 `/onboarding` 选择
    “公网安全”，最后使用 Dashboard“⑥ MCP 配置”生成的 `https://域名/mcp` 地址。
 
+### 小白公网安全教程（Cloudflare Tunnel）
+
+如果你要让 claude.ai 等云端客户端连接，请严格按下面顺序操作。安装器默认仍只监听
+`127.0.0.1`，不会把 Ombre Brain 端口直接暴露到公网。
+
+1. **准备 Cloudflare**：在自己的电脑浏览器打开 <https://one.dash.cloudflare.com>，登录或注册
+   Cloudflare，并确认要使用的域名已经添加并托管在 Cloudflare。
+2. **通过 SSH 打开 Dashboard**：在自己的电脑终端执行安装完成时显示的 SSH 命令（不要在服务器
+   终端执行），保持这个 SSH 窗口一直开着；然后在自己的电脑浏览器打开
+   `http://127.0.0.1:18001`（如果安装时改了端口，按实际端口替换）。
+3. **创建并启动 Tunnel**：在 Cloudflare Zero Trust 中进入 **Networks → Tunnels → Create a
+   tunnel**，选择 **Cloudflared**，填写名称并继续；在 **Install connector** 页面选择
+   **Docker**，复制 `--token` 后面的长 Token（通常以 `eyJ` 开头）。回到 Dashboard → 设置 →
+   **Cloudflare Tunnel**，粘贴 Token，点击“保存 Token”再点击“启动”，等待状态变成绿色“已连接”。
+4. **添加 Public Hostname**：回到 Cloudflare 刚创建的 Tunnel，进入 **Public Hostnames → Add a
+   public hostname**。Domain 填你的域名（例如 `ombre.example.com`）；Service Type 选 **HTTP**；
+   URL 填 `localhost:8000`，保存后等待约 30 秒。
+5. **选择公网安全模式**：在 Dashboard 打开 `/onboarding`，选择“公网安全模式”，填写完整 HTTPS
+   地址（例如 `https://ombre.example.com`）。不能填写公网 IP，也不能使用 `http://`；保存后按
+   页面提示重启服务。
+6. **连接 MCP**：打开 Dashboard → **⑥ MCP 配置**，复制生成的
+   `https://你的域名/mcp`，添加到 claude.ai、Claude Code 或其他支持 OAuth 的 MCP 客户端。
+
+遇到连接失败时，先确认 Cloudflare Tunnel 状态为绿色“已连接”、Public Hostname 域名能打开
+Dashboard，再确认 `/onboarding` 中的 HTTPS 地址与域名完全一致。不要把 Cloudflare Token 发给别人。
+
 首次连接前，先在 Dashboard“③ 引擎”分别配置并测试压缩模型和向量模型，再到“⑥ MCP 配置”复制
 客户端配置。若 `/mcp` 返回 `401`，通常表示网络已经连通但客户端还没有完成 OAuth/Token 鉴权；
 若公网 `/health` 超时，则先检查绑定地址、防火墙和云厂商安全组。
