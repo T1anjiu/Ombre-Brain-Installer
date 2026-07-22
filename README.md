@@ -54,10 +54,12 @@ sudo yum install -y curl ca-certificates
 远程访问推荐在自己的电脑上执行 SSH 转发：
 
 ```bash
-ssh -L 18001:127.0.0.1:18001 user@SERVER_IP
+ssh -N -L 18001:127.0.0.1:18001 user@SERVER_PUBLIC_IP
 ```
 
-然后打开 <http://127.0.0.1:18001>。
+安装完成后的提示会尝试自动填入 VPS 公网 IPv4；如果云厂商阻止公网 IP 查询，再把
+`SERVER_PUBLIC_IP` 替换成控制台显示的地址。SSH 用户名默认取当前登录用户，也可以提前设置
+`OMBRE_SSH_USER` 覆盖。保持 SSH 窗口开启，然后打开 <http://127.0.0.1:18001>。
 
 ## 常用命令
 
