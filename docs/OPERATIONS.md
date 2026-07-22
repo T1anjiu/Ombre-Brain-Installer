@@ -85,6 +85,11 @@ ombrectl uninstall
 - 高级模式只接受明确的 IPv4 绑定和最后一跳代理 CIDR，不安装 Caddy/nginx、不申请证书，
   并拒绝把 `0.0.0.0/0` 或 `::/0` 设为可信代理。
 
+不要把 `http://服务器公网IP:18001/mcp` 当作默认公网 MCP 地址。默认回环绑定会让该地址无法
+从互联网连接；即使把端口开放到公网，MCP 远程 OAuth 也应使用 HTTPS 域名而不是裸 IP 明文 HTTP。
+本机或 SSH 转发客户端使用 `http://127.0.0.1:18001/mcp`，可信局域网客户端使用绑定后的局域网 IP，
+claude.ai 等云端客户端则必须使用 Cloudflare Tunnel 或其他明确配置的 HTTPS 反向代理地址。
+
 ### 配置来源与优先级
 
 推荐让 Dashboard 管理模型配置。此时安装器写入空的 provider 环境值，应用会忽略空值，
@@ -101,6 +106,23 @@ Anthropic 或自定义接口写入 `ombre.env`；非空环境变量优先级最�
 
 本机或 SSH 转发适合运行在自己电脑上的 Claude Desktop / Claude Code；claude.ai 连接需要
 上文的公网安全模式和 HTTPS 地址。
+
+排查连接层时先不要直接测试 `/mcp`，因为未完成鉴权时返回 `401` 是正常现象。先在服务器执行：
+
+```bash
+ombrectl status
+curl -i http://127.0.0.1:18001/health
+```
+
+再从外部电脑测试：
+
+```bash
+curl -i http://服务器公网IP:18001/health
+```
+
+外部请求超时通常是回环绑定、防火墙或云安全组问题；`401`/`405` 则说明网络已经连通，接下来
+应检查 MCP 客户端是否支持项目要求的 OAuth/Token 流程，以及是否使用了 Dashboard“⑥ MCP 配置”
+生成的完整地址。
 
 ### 开机自启策略
 

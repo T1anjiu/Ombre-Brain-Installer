@@ -61,6 +61,28 @@ ssh -N -L 18001:127.0.0.1:18001 user@SERVER_PUBLIC_IP
 `SERVER_PUBLIC_IP` 替换成控制台显示的地址。SSH 用户名默认取当前登录用户，也可以提前设置
 `OMBRE_SSH_USER` 覆盖。保持 SSH 窗口开启，然后打开 <http://127.0.0.1:18001>。
 
+## MCP 连接方式
+
+默认安装只监听 `127.0.0.1`，因此下面这个地址**不能**直接从公网使用：
+
+```text
+http://SERVER_PUBLIC_IP:18001/mcp
+```
+
+按 MCP 客户端所在位置选择连接方式：
+
+1. **Claude Desktop / Claude Code 在自己的电脑上运行**：先在自己的电脑执行上面的 SSH 转发，
+   然后把 MCP 地址填写为 `http://127.0.0.1:18001/mcp`。
+2. **可信局域网客户端**：运行 `ombrectl configure`，选择“可信局域网（0.0.0.0）”，只允许
+   可信网段访问防火墙端口，再使用 `http://服务器局域网IP:18001/mcp`。不要把它直接暴露到互联网。
+3. **claude.ai 或其他云端 MCP 客户端**：云端服务不能访问你的 `127.0.0.1`，也不建议用公网 IP
+   加明文 HTTP。先通过 SSH 进入 Dashboard，配置内置 Cloudflare Tunnel，在 `/onboarding` 选择
+   “公网安全”，最后使用 Dashboard“⑥ MCP 配置”生成的 `https://域名/mcp` 地址。
+
+首次连接前，先在 Dashboard“③ 引擎”分别配置并测试压缩模型和向量模型，再到“⑥ MCP 配置”复制
+客户端配置。若 `/mcp` 返回 `401`，通常表示网络已经连通但客户端还没有完成 OAuth/Token 鉴权；
+若公网 `/health` 超时，则先检查绑定地址、防火墙和云厂商安全组。
+
 ## 常用命令
 
 ```bash
