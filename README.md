@@ -88,7 +88,8 @@ Caddy 本身免费，不需要注册 Cloudflare、绑定银行卡或购买证书
 安装前先完成两件事：
 
 1. 在域名服务商添加 **A 记录**，例如把 `brain.example.com` 指向这台 VPS 的公网 IPv4；等待解析生效。
-   如果 DNS 恰好托管在 Cloudflare，请先设为灰云 **DNS only**，不要让代理地址替代 VPS 的真实 A 记录。
+   如果 DNS 托管在 Cloudflare，灰云 **DNS only** 和橙云 **Proxied** 都可以。安装器会识别 Cloudflare
+   官方边缘地址；橙云会隐藏真实源站 IP，因此请自行确认 Cloudflare 中记录的目标仍是这台 VPS。
 2. 在云厂商安全组和服务器防火墙中放行入站 **TCP 80 和 443**。应用端口 `18001` 不需要对公网开放。
 
 运行安装器后选择“公网自动 HTTPS（VPS + 自有域名，Caddy，推荐）”，输入域名。安装器会检查 A
@@ -103,6 +104,11 @@ Caddy 本身免费，不需要注册 Cloudflare、绑定银行卡或购买证书
 `ombrectl doctor`，再检查 A 记录、TCP 80/443 和 `sudo docker logs --tail 100 ombre-brain-caddy`；
 修正后执行 `ombrectl restart` 会自动重试。若 80/443 已由自己的 Nginx/Caddy 占用，请使用
 “高级自定义绑定”，安装器不会覆盖现有反向代理。
+
+Cloudflare 橙云下，Caddy 会禁用会被边缘节点终止的 TLS-ALPN 验证，固定通过 **HTTP-01** 首次签发，
+所以 TCP 80 必须能经 Cloudflare 到达本机 Caddy。若首次签发失败，请临时关闭 Cloudflare 的
+**Always Use HTTPS** 或其他 HTTP→HTTPS 重定向规则；证书签发成功后，将 SSL/TLS 模式设为
+**Full (strict)**，再恢复边缘 HTTPS 重定向。
 
 ### 备选公网教程（Cloudflare Tunnel）
 

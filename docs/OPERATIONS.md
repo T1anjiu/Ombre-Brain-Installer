@@ -95,12 +95,14 @@ Ombre Brain 的 Compose 调用固定使用隔离项目名 `ombre-brain-managed`�
 选择 Caddy 模式时，安装器先规范化域名，只接受域名或 `https://域名[/mcp]`，拒绝裸 IP、
 自定义端口、明文 `http://`、凭据和额外路径。随后检查：
 
-- 域名存在 A 记录；能探测公网 IPv4 时，所有 A 记录都必须指向本机公网地址；
+- 域名存在 A 记录；直连域名在能探测公网 IPv4 时，所有 A 记录都必须指向本机公网地址；若所有
+  A 记录都属于 Cloudflare 官方 IPv4 网段，则识别为橙云代理并跳过源站 IP 直连比对；
 - TCP 80/443 没有被其他服务占用；已经运行且标签匹配的 ombrectl Caddy 除外；
 - 固定容器名没有被不属于安装器的容器占用。
 
-若 DNS 托管在 Cloudflare，预检时应暂时使用灰云 **DNS only**；橙云代理解析到的是 Cloudflare
-边缘地址，不是本机公网 IPv4，会被单机 Caddy 预检拒绝。
+Cloudflare 灰云 **DNS only** 和橙云 **Proxied** 均受支持。橙云只向公共 DNS 暴露 Cloudflare
+边缘地址，安装器无法据此核对代理后的源站 IP，因此操作者仍须确认 Cloudflare 中 A 记录的目标是
+本机公网 IPv4。混合 Cloudflare/非 Cloudflare 地址或其他未知 CDN 地址不会按橙云放行。
 
 安装器不会自动修改 DNS、iptables/firewalld/ufw 或云安全组。预检通过后生成：
 
@@ -114,6 +116,11 @@ Caddy 与 Ombre Brain 只额外挂到标签受控的专用网络 `ombre-brain-ca
 `ombre-brain:8000` 通信；只有 Caddy 发布 80/443，应用宿主端口仍只绑定回环地址。安装器读取
 该专用网络的实际 IPv4 子网并加入 `OMBRE_TRUSTED_PROXY_CIDRS`，不会信任默认 Docker 网络或
 `0.0.0.0/0`。Caddy 自动设置标准 `X-Forwarded-*` 请求头，并为长连接关闭反代刷新缓冲。
+
+橙云会在边缘终止 TLS-ALPN，因此受管理 Caddyfile 显式禁用 TLS-ALPN challenge，使用 HTTP-01
+完成首次签发和后续续期。入站 TCP 80 必须能够经 Cloudflare 到达本机 Caddy。若 Cloudflare 的
+**Always Use HTTPS** 或其他边缘规则在首次签发前强制跳转 HTTPS，可能形成源站尚无证书的启动循环；
+可临时关闭该重定向，证书签发成功后把 SSL/TLS 模式设为 **Full (strict)**，再恢复重定向。
 
 Ombre Brain 必须先通过本机健康检查，安装器才启动 Caddy。随后安装器使用
 `curl --resolve 域名:443:127.0.0.1` 在本机验证真实证书、SNI 和 `/health` 反代链路。证书签发

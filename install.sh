@@ -871,6 +871,12 @@ render_caddyfile() {
     '}' \
     '' \
     "$PUBLIC_DOMAIN {" \
+    '    tls {' \
+    '        issuer acme {' \
+    '            disable_tlsalpn_challenge' \
+    '        }' \
+    '    }' \
+    '' \
     '    reverse_proxy ombre-brain:8000 {' \
     '        flush_interval -1' \
     '    }' \
@@ -2007,6 +2013,65 @@ resolve_domain_ipv4s() {
   done <<<"$raw"
 }
 
+ipv4_to_uint() {
+  local address=${1-} a b c d
+  validate_ipv4 "$address" || return 1
+  IFS='.' read -r a b c d <<<"$address"
+  printf '%u\n' "$(((10#$a << 24) + (10#$b << 16) + (10#$c << 8) + 10#$d))"
+}
+
+ipv4_in_cidr() {
+  local address=${1-} cidr=${2-} network prefix address_value network_value mask
+  [[ "$cidr" == */* ]] || return 1
+  network=${cidr%/*}
+  prefix=${cidr##*/}
+  [[ "$prefix" =~ ^[0-9]{1,2}$ ]] && ((10#$prefix <= 32)) || return 1
+  address_value="$(ipv4_to_uint "$address")" || return 1
+  network_value="$(ipv4_to_uint "$network")" || return 1
+  if ((10#$prefix == 0)); then
+    mask=0
+  else
+    mask=$(((0xFFFFFFFF << (32 - 10#$prefix)) & 0xFFFFFFFF))
+  fi
+  (((address_value & mask) == (network_value & mask)))
+}
+
+is_cloudflare_proxy_ipv4() {
+  local address=${1-} cidr
+  # Source: https://www.cloudflare.com/ips-v4 (verified 2026-07-23).
+  local -a cloudflare_ipv4_cidrs=(
+    '173.245.48.0/20'
+    '103.21.244.0/22'
+    '103.22.200.0/22'
+    '103.31.4.0/22'
+    '141.101.64.0/18'
+    '108.162.192.0/18'
+    '190.93.240.0/20'
+    '188.114.96.0/20'
+    '197.234.240.0/22'
+    '198.41.128.0/17'
+    '162.158.0.0/15'
+    '104.16.0.0/13'
+    '104.24.0.0/14'
+    '172.64.0.0/13'
+    '131.0.72.0/22'
+  )
+  for cidr in "${cloudflare_ipv4_cidrs[@]}"; do
+    ipv4_in_cidr "$address" "$cidr" && return 0
+  done
+  return 1
+}
+
+all_ipv4s_are_cloudflare_proxies() {
+  local addresses=${1-} address found=0
+  while IFS= read -r address; do
+    [[ -n "$address" ]] || continue
+    is_cloudflare_proxy_ipv4 "$address" || return 1
+    found=1
+  done <<<"$addresses"
+  ((found))
+}
+
 validate_caddy_preflight() {
   local addresses="" public_ip="" address display="" match=0 mismatch=0
   [[ "$ACCESS_MODE" == "public_caddy" ]] || return 0
@@ -2019,7 +2084,7 @@ validate_caddy_preflight() {
   caddy_asset_is_managed_or_absent "$(caddy_config_file)" \
     || die "发现非 ombrectl 管理的同名 Caddyfile：$(caddy_config_file)"
   if ((DRY_RUN)); then
-    info "演练模式：将检查 $PUBLIC_DOMAIN 的 A 记录是否指向本机公网 IPv4。"
+    info "演练模式：将检查 $PUBLIC_DOMAIN 的 A 记录是直连本机公网 IPv4，或全部属于 Cloudflare 代理地址。"
     info "演练模式：将检查 TCP 80/443 未被其他服务占用；不会修改 DNS 或防火墙。"
     return 0
   fi
@@ -2028,22 +2093,29 @@ validate_caddy_preflight() {
     || die "域名 $PUBLIC_DOMAIN 暂无可用 A 记录。请先把它指向本机公网 IPv4，等待 DNS 生效后重试。"
   display="$(printf '%s\n' "$addresses" | paste -sd, - | sed 's/,/, /g')"
   info "域名 A 记录：$PUBLIC_DOMAIN -> $display"
-  public_ip="$(detect_public_ipv4 || true)"
-  if [[ -n "$public_ip" ]]; then
-    while IFS= read -r address; do
-      if [[ "$address" == "$public_ip" ]]; then
-        match=1
-      else
-        mismatch=1
-      fi
-    done <<<"$addresses"
-    ((match)) \
-      || die "域名 $PUBLIC_DOMAIN 当前未指向本机公网 IPv4 $public_ip（解析结果：$display）。修正 A 记录并等待生效后重试。"
-    ((!mismatch)) \
-      || die "域名 $PUBLIC_DOMAIN 还包含其他 A 记录（$display）。单机 Caddy 模式要求所有 A 记录都指向 $public_ip，否则证书验证可能随机失败。"
-    success "域名已指向本机公网 IPv4：$public_ip"
+  if all_ipv4s_are_cloudflare_proxies "$addresses"; then
+    success "已识别 Cloudflare 橙云代理；允许继续使用代理后的域名。"
+    warn "公共 DNS 只会显示 Cloudflare 边缘 IP，安装器无法核对代理后的源站地址；请确认 Cloudflare 中该 A 记录仍指向本机公网 IPv4。"
+    warn "首次签发使用 HTTP-01：必须放行入站 TCP 80，并让 Cloudflare 的 HTTP 请求能够到达本机 Caddy。"
+    warn "若首次签发失败，请临时关闭 Cloudflare 的 Always Use HTTPS/其他强制重定向；成功后再启用 Full (strict)。"
   else
-    warn "无法自动探测本机公网 IPv4；已确认域名可解析，但请自行核对 A 记录。"
+    public_ip="$(detect_public_ipv4 || true)"
+    if [[ -n "$public_ip" ]]; then
+      while IFS= read -r address; do
+        if [[ "$address" == "$public_ip" ]]; then
+          match=1
+        else
+          mismatch=1
+        fi
+      done <<<"$addresses"
+      ((match)) \
+        || die "域名 $PUBLIC_DOMAIN 当前既不是 Cloudflare 橙云代理，也未指向本机公网 IPv4 $public_ip（解析结果：$display）。修正 A 记录并等待生效后重试。"
+      ((!mismatch)) \
+        || die "域名 $PUBLIC_DOMAIN 还包含其他 A 记录（$display）。单机 Caddy 模式要求所有 A 记录都指向 $public_ip，否则证书验证可能随机失败。"
+      success "域名已指向本机公网 IPv4：$public_ip"
+    else
+      warn "无法自动探测本机公网 IPv4；已确认域名可解析，但请自行核对 A 记录。"
+    fi
   fi
   if ((${#DOCKER[@]} == 0)); then
     set_docker_command >/dev/null 2>&1 || true
@@ -2260,7 +2332,7 @@ post_install_instructions() {
     printf '  在 Dashboard → ⑥ MCP 配置中复制客户端配置并完成授权。\n'
     if ((!CADDY_READY)); then
       printf '\n%s%s证书尚未就绪，但 Ombre Brain 已安装成功并可通过 SSH 使用。%s\n' "$C_BOLD" "$C_YELLOW" "$C_RESET"
-      printf '  请检查：A 记录是否仍指向本机、云安全组/防火墙是否放行入站 TCP 80/443。\n'
+      printf '  请检查：源站 A 记录是否指向本机（橙云请看 Cloudflare 控制台）、入站 TCP 80/443 是否放行。\n'
       printf '  修正后运行：%sombrectl restart%s；诊断：%sombrectl doctor%s\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
       printf '  Caddy 日志：%ssudo docker logs --tail 100 %s%s\n' "$C_BOLD" "$CADDY_CONTAINER_NAME" "$C_RESET"
     fi
@@ -2851,7 +2923,7 @@ doctor_command() {
       success "HTTPS 证书和反向代理可用：https://$PUBLIC_DOMAIN"
     else
       error "本机 TLS 校验失败：https://$PUBLIC_DOMAIN/health"
-      repair_hints+=("检查域名 A 记录、入站 TCP 80/443 和日志：sudo docker logs --tail 100 $CADDY_CONTAINER_NAME")
+      repair_hints+=("检查源站 A 记录（橙云请看 Cloudflare 控制台）、入站 TCP 80/443 和日志：sudo docker logs --tail 100 $CADDY_CONTAINER_NAME")
       failures=$((failures + 1))
     fi
   elif managed_caddy_running; then
