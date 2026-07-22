@@ -9,11 +9,17 @@
 直接复制下面这一整行执行即可：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/T1anjiu/Ombre-Brain-Installer/main/install.sh \
-  -o /tmp/ombre-install.sh && bash /tmp/ombre-install.sh
+curl -fsSL https://raw.githubusercontent.com/T1anjiu/Ombre-Brain-Installer/main/install.sh | bash
 ```
 
 安装器随后会交互式检查 Docker、Compose v2、磁盘、内存、端口和网络，并在执行前展示完整摘要。
+
+如果希望先保存脚本再查看或执行，也可以使用：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/T1anjiu/Ombre-Brain-Installer/main/install.sh \
+  -o /tmp/ombre-install.sh && bash /tmp/ombre-install.sh
+```
 
 ### 如果提示 `curl: command not found`
 
